@@ -563,6 +563,12 @@ struct pan_kmod_dev *
 pan_kmod_dev_create(int fd, uint32_t flags,
                     const struct pan_kmod_allocator *allocator);
 
+struct pan_kmod_dev *
+pan_kmod_dev_create_with_driver(int fd, uint32_t flags,
+                                const char *driver_name,
+                                const struct pan_kmod_driver *driver,
+                                const struct pan_kmod_allocator *allocator);
+
 void pan_kmod_dev_destroy(struct pan_kmod_dev *dev);
 
 static inline struct pan_kmod_va_range

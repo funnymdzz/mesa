@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <errno.h>
 #include <string.h>
 #include <xf86drm.h>
 
@@ -12,21 +13,38 @@
 #include "pan_kmod.h"
 #include "pan_kmod_backend.h"
 
+#if defined(HAVE_PAN_KMOD_PANFROST)
 extern const struct pan_kmod_ops panfrost_kmod_ops;
+#endif
+#if defined(HAVE_PAN_KMOD_PANTHOR)
 extern const struct pan_kmod_ops panthor_kmod_ops;
+#endif
+#if defined(HAVE_PAN_KMOD_KBASE)
+extern const struct pan_kmod_ops kbase_kmod_ops;
+#endif
 
 static const struct {
    const char *name;
    const struct pan_kmod_ops *ops;
 } drivers[] = {
+#if defined(HAVE_PAN_KMOD_PANFROST)
    {
       "panfrost",
       &panfrost_kmod_ops,
    },
+#endif
+#if defined(HAVE_PAN_KMOD_PANTHOR)
    {
       "panthor",
       &panthor_kmod_ops,
    },
+#endif
+#if defined(HAVE_PAN_KMOD_KBASE)
+   {
+      "kbase",
+      &kbase_kmod_ops,
+   },
+#endif
 };
 
 static void *
@@ -48,17 +66,46 @@ static const struct pan_kmod_allocator default_allocator = {
 };
 
 struct pan_kmod_dev *
+pan_kmod_dev_create_with_driver(int fd, uint32_t flags,
+                                const char *driver_name,
+                                const struct pan_kmod_driver *driver,
+                                const struct pan_kmod_allocator *allocator)
+{
+   if (!allocator)
+      allocator = &default_allocator;
+
+   if (!driver_name || !driver_name[0]) {
+      errno = EINVAL;
+      return NULL;
+   }
+
+   const struct pan_kmod_driver fallback_driver = {
+      .version = {
+         .major = 0,
+         .minor = 0,
+      },
+   };
+
+   if (!driver)
+      driver = &fallback_driver;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(drivers); i++) {
+      if (!strcmp(drivers[i].name, driver_name))
+         return drivers[i].ops->dev_create(fd, flags, driver, allocator);
+   }
+
+   errno = ENODEV;
+   return NULL;
+}
+
+struct pan_kmod_dev *
 pan_kmod_dev_create(int fd, uint32_t flags,
                     const struct pan_kmod_allocator *allocator)
 {
    drmVersionPtr version = drmGetVersion(fd);
-   struct pan_kmod_dev *dev = NULL;
 
    if (!version)
       return NULL;
-
-   if (!allocator)
-      allocator = &default_allocator;
 
    const char *drv_name = version->name;
    const struct pan_kmod_driver drv_info = {
@@ -68,14 +115,8 @@ pan_kmod_dev_create(int fd, uint32_t flags,
       },
    };
 
-   for (unsigned i = 0; i < ARRAY_SIZE(drivers); i++) {
-      if (!strcmp(drivers[i].name, drv_name)) {
-         const struct pan_kmod_ops *ops = drivers[i].ops;
-
-         dev = ops->dev_create(fd, flags, &drv_info, allocator);
-         break;
-      }
-   }
+   struct pan_kmod_dev *dev =
+      pan_kmod_dev_create_with_driver(fd, flags, drv_name, &drv_info, allocator);
 
    drmFreeVersion(version);
    return dev;
