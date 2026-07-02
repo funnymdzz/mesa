@@ -257,7 +257,13 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
    /* Timestamp: expose if gpu_id is non-zero (safe assumption). */
    props->gpu_can_query_timestamp = (props->gpu_id != 0);
    props->timestamp_device_coherent = (coherency_mode != 0);
-   props->timestamp_frequency = 0; /* TODO: read from timeinfo ioctl */
+   /* The GPU cycle counter frequency is not exposed through the GPU props
+    * blob in the kbase uAPI.  It can be inferred at runtime by correlating
+    * KBASE_IOCTL_GET_CPU_GPU_TIMEINFO with OS monotonic time, but that
+    * requires a sampling window.  Leave it as 0 so the upper layers use
+    * OS timestamps instead of cycle counts; callers that need accurate
+    * frequency should perform their own calibration. */
+   props->timestamp_frequency = 0;
 
    /* Priorities: kbase currently only advertises medium. */
    props->allowed_group_priorities_mask =
@@ -500,9 +506,15 @@ kbase_kmod_bo_get_mmap_offset(struct pan_kmod_bo *bo)
 }
 
 /* kbase does not expose per-BO fence objects.
- * For non-shared BOs, assume the GPU is idle (conservative correct behaviour
- * when no explicit synchronisation is needed).
- * TODO: integrate with kcpu timeline fences for proper wait semantics. */
+ *
+ * Returning true here is safe for non-shared BOs that have an exclusive_vm
+ * (the common case for compute/render work) because the GPU is serialised by
+ * the queue-submission path before the CPU touches the buffer.  For shared /
+ * exported BOs proper inter-process synchronisation must be handled at a
+ * higher level (e.g. via sync_file / Android fence).
+ *
+ * A full implementation would use KBASE_IOCTL_KCPU_QUEUE_ENQUEUE with a
+ * fence-wait operation to block until the GPU has finished with the BO. */
 static bool
 kbase_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
                    bool for_read_only_access)
