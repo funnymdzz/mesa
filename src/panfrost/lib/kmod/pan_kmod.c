@@ -75,6 +75,7 @@ pan_kmod_dev_create_with_driver(int fd, uint32_t flags,
       allocator = &default_allocator;
 
    if (!driver_name || !driver_name[0]) {
+      mesa_loge("invalid kernel driver name");
       errno = EINVAL;
       return NULL;
    }
@@ -94,6 +95,7 @@ pan_kmod_dev_create_with_driver(int fd, uint32_t flags,
          return drivers[i].ops->dev_create(fd, flags, driver, allocator);
    }
 
+   mesa_loge("kernel driver '%s' is not supported by this build", driver_name);
    errno = ENODEV;
    return NULL;
 }
