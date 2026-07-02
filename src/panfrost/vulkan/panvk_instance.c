@@ -189,7 +189,7 @@ panvk_enumerate_physical_devices(struct vk_instance *vk_instance)
 
 #if defined(HAVE_PAN_KMOD_KBASE)
    /* Enumerate kbase (Mali) non-DRM nodes. */
-   for (int i = 0; i < 8; i++) {
+   for (int i = 0; i < PAN_KBASE_MAX_NODES; i++) {
       char path[PATH_MAX];
       snprintf(path, sizeof(path), "/dev/mali%d", i);
 

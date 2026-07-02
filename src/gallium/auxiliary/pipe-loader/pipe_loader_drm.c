@@ -336,8 +336,8 @@ pipe_loader_drm_zink_probe(struct pipe_loader_device **devs, int ndev)
 #endif
 
 #if defined(HAVE_PAN_KMOD_KBASE)
+#include "panfrost/lib/kmod/pan_kmod.h"
 #define KBASE_DEV_NAME_FORMAT "/dev/mali%d"
-#define KBASE_MAX_NODES 8
 
 static int
 open_kbase_node(int minor)
@@ -385,12 +385,12 @@ fail:
 int
 pipe_loader_kbase_probe(struct pipe_loader_device **devs, int ndev)
 {
-   int i, j, fd;
+   int node_index, device_count, fd;
 
-   for (i = 0, j = 0; i < KBASE_MAX_NODES; i++) {
+   for (node_index = 0, device_count = 0; node_index < PAN_KBASE_MAX_NODES; node_index++) {
       struct pipe_loader_device *dev;
 
-      fd = open_kbase_node(i);
+      fd = open_kbase_node(node_index);
       if (fd < 0)
          continue;
 
@@ -399,16 +399,16 @@ pipe_loader_kbase_probe(struct pipe_loader_device **devs, int ndev)
          continue;
       }
 
-      if (j < ndev) {
-         devs[j] = dev;
+      if (device_count < ndev) {
+         devs[device_count] = dev;
       } else {
          close(fd);
          dev->ops->release(&dev);
       }
-      j++;
+      device_count++;
    }
 
-   return j;
+   return device_count;
 }
 #endif /* HAVE_PAN_KMOD_KBASE */
 

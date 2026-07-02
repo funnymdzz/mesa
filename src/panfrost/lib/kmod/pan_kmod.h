@@ -39,6 +39,11 @@
 #include "kmod/panthor_kmod.h"
 #include "pan_trace.h"
 
+/* Maximum number of /dev/mali* device nodes to probe. */
+#if defined(HAVE_PAN_KMOD_KBASE)
+#define PAN_KBASE_MAX_NODES 8
+#endif
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
