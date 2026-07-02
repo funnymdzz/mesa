@@ -94,6 +94,12 @@ VkResult panvk_physical_device_init(struct panvk_physical_device *device,
                                     struct panvk_instance *instance,
                                     drmDevicePtr drm_device);
 
+#if defined(HAVE_PAN_KMOD_KBASE)
+VkResult panvk_physical_device_init_kbase(struct panvk_physical_device *device,
+                                          struct panvk_instance *instance,
+                                          const char *path);
+#endif
+
 void panvk_physical_device_finish(struct panvk_physical_device *device);
 
 

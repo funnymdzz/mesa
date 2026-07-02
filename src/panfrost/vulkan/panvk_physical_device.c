@@ -11,6 +11,7 @@
 
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
+#include <fcntl.h>
 
 #include "util/disk_cache.h"
 #include "util/os_misc.h"
@@ -114,6 +115,41 @@ create_kmod_dev(struct panvk_physical_device *device,
 
    return VK_SUCCESS;
 }
+
+#if defined(HAVE_PAN_KMOD_KBASE)
+static VkResult
+create_kmod_dev_kbase(struct panvk_physical_device *device,
+                      const struct panvk_instance *instance,
+                      const char *path)
+{
+   int fd;
+
+   fd = open(path, O_RDWR | O_CLOEXEC);
+   if (fd < 0) {
+      return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                          "failed to open kbase device %s", path);
+   }
+
+   if (PANVK_DEBUG(STARTUP))
+      mesa_logi("Found kbase device '%s'.", path);
+
+   uint32_t flags = PAN_KMOD_DEV_FLAG_OWNS_FD;
+
+   if (PANVK_DEBUG(NO_USER_MMAP_SYNC))
+      flags |= PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL;
+
+   device->kmod.dev = pan_kmod_dev_create_with_driver(fd, flags, "kbase", NULL,
+                                                      &instance->kmod.allocator);
+
+   if (!device->kmod.dev) {
+      close(fd);
+      return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                          "cannot create kbase device (not yet implemented)");
+   }
+
+   return VK_SUCCESS;
+}
+#endif /* HAVE_PAN_KMOD_KBASE */
 
 static VkResult
 get_drm_device_ids(struct panvk_physical_device *device,
@@ -515,6 +551,135 @@ fail:
 
    return result;
 }
+
+#if defined(HAVE_PAN_KMOD_KBASE)
+VkResult
+panvk_physical_device_init_kbase(struct panvk_physical_device *device,
+                                 struct panvk_instance *instance,
+                                 const char *path)
+{
+   VkResult result;
+
+   result = create_kmod_dev_kbase(device, instance, path);
+   if (result != VK_SUCCESS)
+      return result;
+
+   device->model = pan_get_model(device->kmod.dev->props.gpu_id,
+                                 device->kmod.dev->props.gpu_variant);
+
+   unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
+
+   if (!device->model) {
+      result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                            "Unknown gpu_id (%#" PRIx64 ") or variant (%#x)",
+                            device->kmod.dev->props.gpu_id,
+                            device->kmod.dev->props.gpu_variant);
+      goto fail_kbase;
+   }
+
+   switch (arch) {
+   case 6:
+   case 7:
+   case 14:
+      if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
+         result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                               "WARNING: panvk is not well-tested on v%d, "
+                               "pass PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 "
+                               "if you know what you're doing.", arch);
+         goto fail_kbase;
+      }
+      break;
+
+   case 10:
+   case 12:
+   case 13:
+      break;
+
+   default:
+      result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                            "%s not supported", device->model->name);
+      goto fail_kbase;
+   }
+
+   /* kbase does not expose DRM nodes, so drm.{render,primary}_rdev are left
+    * zeroed; WSI paths that compare rdev values will simply not match. */
+
+   device->formats.all = pan_format_table(arch);
+   device->formats.blendable = pan_blendable_format_table(arch);
+
+   unsigned core_id_range;
+   unsigned core_count =
+      pan_query_core_count(&device->kmod.dev->props, &core_id_range);
+
+   memset(device->name, 0, sizeof(device->name));
+   sprintf(device->name, "%s MC%u", device->model->name, core_count);
+
+   result = get_core_masks(device, instance);
+   if (result != VK_SUCCESS)
+      goto fail_kbase;
+
+   result = get_device_heaps(device, instance);
+   if (result != VK_SUCCESS)
+      goto fail_kbase;
+
+   result = get_device_sync_types(device, instance);
+   if (result != VK_SUCCESS)
+      goto fail_kbase;
+
+   if (arch >= 10) {
+      device->csf.tiler.chunk_size = 2 * 1024 * 1024;
+      device->csf.tiler.initial_chunks = 5;
+      device->csf.tiler.max_chunks = 64;
+   }
+
+   if (arch != 10)
+      vk_warn_non_conformant_implementation("panvk");
+
+   struct vk_device_extension_table supported_extensions;
+   panvk_arch_dispatch(arch, get_physical_device_extensions, device,
+                       &supported_extensions);
+
+   struct vk_features supported_features;
+   panvk_arch_dispatch(arch, get_physical_device_features, instance,
+                       device, &supported_features);
+
+   struct vk_physical_device_dispatch_table dispatch_table;
+   vk_physical_device_dispatch_table_from_entrypoints(
+      &dispatch_table, &panvk_physical_device_entrypoints, true);
+   vk_physical_device_dispatch_table_from_entrypoints(
+      &dispatch_table, &wsi_physical_device_entrypoints, false);
+
+   result =
+      vk_physical_device_init(&device->vk, &instance->vk, &supported_extensions,
+                              &supported_features, NULL, &dispatch_table);
+
+   if (result != VK_SUCCESS)
+      goto fail_kbase;
+
+   init_shader_caches(device, instance);
+
+   panvk_arch_dispatch(arch, get_physical_device_properties, instance, device,
+                       &device->vk.properties);
+
+   device->vk.supported_sync_types = device->sync_types;
+
+   result = panvk_wsi_init(device);
+   if (result != VK_SUCCESS)
+      goto fail_kbase;
+
+   return VK_SUCCESS;
+
+fail_kbase:
+   free_disk_cache(device);
+
+   if (device->vk.instance)
+      vk_physical_device_finish(&device->vk);
+
+   pan_kmod_dev_destroy(device->kmod.dev);
+
+   return result;
+}
+#endif /* HAVE_PAN_KMOD_KBASE */
 
 static void
 panvk_fill_global_priority(const struct panvk_physical_device *physical_device,

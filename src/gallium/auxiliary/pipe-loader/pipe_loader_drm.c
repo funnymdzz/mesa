@@ -82,6 +82,9 @@ static const struct drm_driver_descriptor *driver_descriptors[] = {
    &vc4_driver_descriptor,
    &panfrost_driver_descriptor,
    &panthor_driver_descriptor,
+#if defined(HAVE_PAN_KMOD_KBASE)
+   &kbase_driver_descriptor,
+#endif
    &asahi_driver_descriptor,
    &etnaviv_driver_descriptor,
    &rocket_driver_descriptor,
@@ -331,6 +334,78 @@ pipe_loader_drm_zink_probe(struct pipe_loader_device **devs, int ndev)
    return pipe_loader_drm_probe_internal(devs, ndev, true);
 }
 #endif
+
+#if defined(HAVE_PAN_KMOD_KBASE)
+#define KBASE_DEV_NAME_FORMAT "/dev/mali%d"
+#define KBASE_MAX_NODES 8
+
+static int
+open_kbase_node(int minor)
+{
+   char path[PATH_MAX];
+   snprintf(path, sizeof(path), KBASE_DEV_NAME_FORMAT, minor);
+   return loader_open_device(path);
+}
+
+static bool
+pipe_loader_kbase_probe_fd_nodup(struct pipe_loader_device **dev, int fd)
+{
+   struct pipe_loader_drm_device *ddev = CALLOC_STRUCT(pipe_loader_drm_device);
+
+   if (!ddev)
+      return false;
+
+   ddev->base.type = PIPE_LOADER_DEVICE_PLATFORM;
+   ddev->base.ops = &pipe_loader_drm_ops;
+   ddev->fd = fd;
+
+   /* kbase is not a DRM driver; hardcode the driver name */
+   ddev->base.driver_name = strdup("kbase");
+   if (!ddev->base.driver_name)
+      goto fail;
+
+   ddev->dd = get_driver_descriptor(ddev->base.driver_name);
+   if (!ddev->dd)
+      goto fail;
+
+   *dev = &ddev->base;
+   return true;
+
+fail:
+   FREE(ddev->base.driver_name);
+   FREE(ddev);
+   return false;
+}
+
+int
+pipe_loader_kbase_probe(struct pipe_loader_device **devs, int ndev)
+{
+   int i, j, fd;
+
+   for (i = 0, j = 0; i < KBASE_MAX_NODES; i++) {
+      struct pipe_loader_device *dev;
+
+      fd = open_kbase_node(i);
+      if (fd < 0)
+         continue;
+
+      if (!pipe_loader_kbase_probe_fd_nodup(&dev, fd)) {
+         close(fd);
+         continue;
+      }
+
+      if (j < ndev) {
+         devs[j] = dev;
+      } else {
+         close(fd);
+         dev->ops->release(&dev);
+      }
+      j++;
+   }
+
+   return j;
+}
+#endif /* HAVE_PAN_KMOD_KBASE */
 
 static void
 pipe_loader_drm_release(struct pipe_loader_device **dev)
