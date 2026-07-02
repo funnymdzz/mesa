@@ -355,11 +355,16 @@ pipe_loader_kbase_probe_fd_nodup(struct pipe_loader_device **dev, int fd)
    if (!ddev)
       return false;
 
+   /* kbase devices are platform (SoC-integrated) accelerators accessed via
+    * character device nodes (/dev/mali*) rather than DRM render nodes; use
+    * PIPE_LOADER_DEVICE_PLATFORM, the same type the accel probe path uses for
+    * similar non-PCI, non-DRM devices. */
    ddev->base.type = PIPE_LOADER_DEVICE_PLATFORM;
    ddev->base.ops = &pipe_loader_drm_ops;
    ddev->fd = fd;
 
-   /* kbase is not a DRM driver; hardcode the driver name */
+   /* kbase is not a DRM driver so drmGetVersion() is not applicable;
+    * hardcode the driver name. */
    ddev->base.driver_name = strdup("kbase");
    if (!ddev->base.driver_name)
       goto fail;

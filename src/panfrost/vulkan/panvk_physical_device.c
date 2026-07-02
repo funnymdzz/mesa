@@ -144,7 +144,7 @@ create_kmod_dev_kbase(struct panvk_physical_device *device,
    if (!device->kmod.dev) {
       close(fd);
       return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
-                          "cannot create kbase device (not yet implemented)");
+                          "failed to create kbase device at %s", path);
    }
 
    return VK_SUCCESS;
