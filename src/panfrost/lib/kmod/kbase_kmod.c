@@ -28,7 +28,7 @@ kbase_kmod_dev_create(UNUSED int fd, UNUSED uint32_t flags,
 static void
 kbase_kmod_dev_destroy(UNUSED struct pan_kmod_dev *dev)
 {
-   unreachable("kbase_kmod_dev_destroy should never be called");
+   kbase_unsupported("dev_destroy");
 }
 
 static struct pan_kmod_bo *
@@ -43,7 +43,7 @@ kbase_kmod_bo_alloc(UNUSED struct pan_kmod_dev *dev,
 static void
 kbase_kmod_bo_free(UNUSED struct pan_kmod_bo *bo)
 {
-   unreachable("kbase_kmod_bo_free should never be called");
+   kbase_unsupported("bo_free");
 }
 
 static struct pan_kmod_bo *
@@ -107,7 +107,7 @@ kbase_kmod_vm_create(UNUSED struct pan_kmod_dev *dev, UNUSED uint32_t flags,
 static void
 kbase_kmod_vm_destroy(UNUSED struct pan_kmod_vm *vm)
 {
-   unreachable("kbase_kmod_vm_destroy should never be called");
+   kbase_unsupported("vm_destroy");
 }
 
 static int
