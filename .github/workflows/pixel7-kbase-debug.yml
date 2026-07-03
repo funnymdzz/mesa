@@ -35,18 +35,34 @@ jobs:
             libdrm-dev \
             libelf-dev \
             libexpat1-dev \
+            libclang-cpp-dev \
+            libclang-dev \
             libwayland-dev \
             libwayland-egl-backend-dev \
-            meson \
             ninja-build \
             pkgconf \
             python3 \
             python3-mako \
             python3-packaging \
+            python3-pip \
             python3-setuptools \
             python3-yaml \
+            llvm-dev \
+            glslang-tools \
+            spirv-tools \
             wayland-protocols \
+            zlib1g-dev \
             zip
+          LLVM_MAJOR="$(llvm-config --version | cut -d. -f1)"
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends \
+            "libclc-${LLVM_MAJOR}-dev" \
+            "libllvmspirvlib-${LLVM_MAJOR}-dev"
+
+      - name: Install Meson
+        run: |
+          python3 -m pip install --break-system-packages \
+            'meson>=1.4.0,<2'
 
       - name: Configure
         run: |
@@ -63,9 +79,9 @@ jobs:
             -Dgles1=disabled \
             -Dgles2=enabled \
             -Dglx=disabled \
-            -Dllvm=disabled \
+            -Dllvm=enabled \
             -Dopengl=false \
-            -Dpanfrost-kmds=kbase \
+            -Dpanfrost-kmds=kbase,panthor \
             -Dplatforms=wayland \
             -Dvalgrind=disabled \
             -Dvulkan-drivers=panfrost \
