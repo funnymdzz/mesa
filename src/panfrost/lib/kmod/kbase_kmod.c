@@ -378,12 +378,11 @@ kbase_kmod_dev_query_user_va_range(const struct pan_kmod_dev *dev)
    if (va_bits < 32)
       va_bits = 32;
 
-   uint64_t end = va_bits == 32 ? ((1ull << 32) - KBASE_KMOD_VA_RESERVE)
-                                : (1ull << (va_bits - 1));
+   uint64_t end = va_bits == 32 ? (1ull << 32) : (1ull << (va_bits - 1));
 
    return (struct pan_kmod_va_range){
       .start = KBASE_KMOD_VA_RESERVE,
-      .size  = end,
+      .size  = end - KBASE_KMOD_VA_RESERVE,
    };
 }
 
