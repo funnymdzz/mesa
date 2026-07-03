@@ -290,8 +290,14 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    /* Version handshake — request at least major=3, minor=0. */
    struct kbase_ioctl_version_check ver = { .major = 3, .minor = 0 };
    if (drmIoctl(fd, KBASE_IOCTL_VERSION_CHECK, &ver)) {
-      mesa_loge("kbase: KBASE_IOCTL_VERSION_CHECK failed: %s",
-                strerror(errno));
+      if (errno == EPERM || errno == EACCES || errno == ENOTTY ||
+          errno == EINVAL || errno == ENODEV) {
+         mesa_logd("kbase: KBASE_IOCTL_VERSION_CHECK probe rejected: %s",
+                   strerror(errno));
+      } else {
+         mesa_loge("kbase: KBASE_IOCTL_VERSION_CHECK failed: %s",
+                   strerror(errno));
+      }
       return NULL;
    }
 
