@@ -9,12 +9,14 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <sched.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <fcntl.h>
 
 #include "util/disk_cache.h"
 #include "util/os_misc.h"
+#include "util/os_time.h"
 #include "util/u_atomic.h"
 #include "git_sha1.h"
 
@@ -398,6 +400,160 @@ get_device_sync_types(struct panvk_physical_device *device,
    return VK_SUCCESS;
 }
 
+#if defined(HAVE_PAN_KMOD_KBASE)
+
+/* -------------------------------------------------------------------------
+ * CPU-based binary sync type for kbase
+ *
+ * kbase does not expose DRM syncobj, so a host-side spin-wait binary sync is
+ * used as a placeholder.  It provides all features required by
+ * vk_sync_timeline_get_type() and by the panvk physical-device init path.
+ * Actual GPU synchronisation for kbase will be wired up separately.
+ * ---------------------------------------------------------------------- */
+
+struct kbase_cpu_sync {
+   struct vk_sync sync;
+   uint32_t signaled; /* accessed via p_atomic_* */
+};
+
+static VkResult
+kbase_cpu_sync_init(struct vk_device *device, struct vk_sync *sync,
+                    uint64_t initial_value)
+{
+   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
+   p_atomic_set(&ks->signaled, initial_value != 0 ? 1 : 0);
+   return VK_SUCCESS;
+}
+
+static void
+kbase_cpu_sync_finish(UNUSED struct vk_device *device,
+                      UNUSED struct vk_sync *sync)
+{
+}
+
+static VkResult
+kbase_cpu_sync_signal(UNUSED struct vk_device *device, struct vk_sync *sync,
+                      UNUSED uint64_t value)
+{
+   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
+   p_atomic_set(&ks->signaled, 1);
+   return VK_SUCCESS;
+}
+
+static VkResult
+kbase_cpu_sync_reset(UNUSED struct vk_device *device, struct vk_sync *sync)
+{
+   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
+   p_atomic_set(&ks->signaled, 0);
+   return VK_SUCCESS;
+}
+
+static VkResult
+kbase_cpu_sync_wait_many(UNUSED struct vk_device *device,
+                         uint32_t wait_count, const struct vk_sync_wait *waits,
+                         enum vk_sync_wait_flags wait_flags,
+                         uint64_t abs_timeout_ns)
+{
+   bool wait_any = !!(wait_flags & VK_SYNC_WAIT_ANY);
+
+   while (true) {
+      bool have_unsignaled = false;
+
+      for (uint32_t i = 0; i < wait_count; i++) {
+         struct kbase_cpu_sync *ks =
+            container_of(waits[i].sync, struct kbase_cpu_sync, sync);
+
+         if (p_atomic_read(&ks->signaled)) {
+            if (wait_any)
+               return VK_SUCCESS;
+         } else {
+            have_unsignaled = true;
+         }
+      }
+
+      if (!have_unsignaled)
+         return VK_SUCCESS;
+
+      if (abs_timeout_ns == 0)
+         return VK_TIMEOUT;
+
+      if (os_time_get_nano() >= abs_timeout_ns)
+         return VK_TIMEOUT;
+
+      sched_yield();
+   }
+}
+
+static VkResult
+kbase_cpu_sync_move(UNUSED struct vk_device *device, struct vk_sync *dst,
+                    struct vk_sync *src)
+{
+   struct kbase_cpu_sync *ks_dst =
+      container_of(dst, struct kbase_cpu_sync, sync);
+   struct kbase_cpu_sync *ks_src =
+      container_of(src, struct kbase_cpu_sync, sync);
+
+   uint32_t val = p_atomic_read(&ks_src->signaled);
+   p_atomic_set(&ks_src->signaled, 0);
+   p_atomic_set(&ks_dst->signaled, val);
+   return VK_SUCCESS;
+}
+
+static const struct vk_sync_type kbase_cpu_sync_type = {
+   .size      = sizeof(struct kbase_cpu_sync),
+   .features  = VK_SYNC_FEATURE_BINARY |
+                VK_SYNC_FEATURE_GPU_WAIT |
+                VK_SYNC_FEATURE_GPU_MULTI_WAIT |
+                VK_SYNC_FEATURE_CPU_WAIT |
+                VK_SYNC_FEATURE_CPU_RESET |
+                VK_SYNC_FEATURE_CPU_SIGNAL |
+                VK_SYNC_FEATURE_WAIT_ANY |
+                VK_SYNC_FEATURE_WAIT_PENDING,
+   .init      = kbase_cpu_sync_init,
+   .finish    = kbase_cpu_sync_finish,
+   .signal    = kbase_cpu_sync_signal,
+   .reset     = kbase_cpu_sync_reset,
+   .wait_many = kbase_cpu_sync_wait_many,
+   .move      = kbase_cpu_sync_move,
+};
+
+/* Set up sync types for a kbase (non-DRM) physical device.
+ *
+ * DRM syncobj is not available on a kbase fd, so we substitute a CPU-based
+ * binary sync type and wrap it in a software timeline for architectures that
+ * require VK_SYNC_FEATURE_TIMELINE (arch >= 10). */
+static VkResult
+get_device_sync_types_kbase(struct panvk_physical_device *device,
+                             UNUSED const struct panvk_instance *instance)
+{
+   const unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
+   uint32_t sync_type_count = 0;
+
+   device->drm_syncobj_type = kbase_cpu_sync_type;
+
+   if (arch >= 10) {
+      /* CSF queues require a timeline sync in sync_types[0].  Wrap the
+       * CPU binary sync in a software timeline emulation. */
+      device->sync_timeline_type =
+         vk_sync_timeline_get_type(&device->drm_syncobj_type);
+      device->sync_types[sync_type_count++] = &device->sync_timeline_type.sync;
+   } else {
+      /* JM (arch < 10): binary sync primary, software timeline secondary. */
+      device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
+
+      device->sync_timeline_type =
+         vk_sync_timeline_get_type(&device->drm_syncobj_type);
+      device->sync_types[sync_type_count++] = &device->sync_timeline_type.sync;
+   }
+
+   assert(sync_type_count < ARRAY_SIZE(device->sync_types));
+   device->sync_types[sync_type_count] = NULL;
+
+   return VK_SUCCESS;
+}
+
+#endif /* HAVE_PAN_KMOD_KBASE */
+
 float
 panvk_get_gpu_system_timestamp_period(const struct panvk_physical_device *device)
 {
@@ -622,7 +778,7 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
    if (result != VK_SUCCESS)
       goto fail_kbase;
 
-   result = get_device_sync_types(device, instance);
+   result = get_device_sync_types_kbase(device, instance);
    if (result != VK_SUCCESS)
       goto fail_kbase;
 
