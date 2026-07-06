@@ -3,31 +3,46 @@
  * SPDX-License-Identifier: MIT
  *
  * kmod backend for the ARM Mali kbase kernel driver (/dev/mali*).
- * Targets the Bifrost/Valhall kbase driver r32p0–r44p0.
+ * Targets the Bifrost/Valhall kbase driver r32p0–r44p0, both the JM
+ * (arch <= 9, uAPI 11.x) and CSF (arch >= 10, uAPI 1.x) flavours.
  *
- * Key architectural differences from the panthor / panfrost DRM backends:
- *  - kbase is not a DRM driver; the fd is not a DRM fd.
- *  - Memory is allocated via KBASE_IOCTL_MEM_ALLOC, which directly returns a
- *    48-bit GPU VA. There are no GEM handles.
- *  - The GPU address space is implicit (one per context) so vm_create and
+ * Key architectural differences from the panthor / panfrost DRM backends
+ * (see the panfork driver, src/panfrost/base/, for a working reference):
+ *
+ *  - kbase is not a DRM driver; the fd is not a DRM fd.  The handshake is:
+ *    VERSION_CHECK (CSF nr 52 / JM nr 0) -> SET_FLAGS -> mmap() of the
+ *    tracking page.  Every other ioctl returns -EPERM before that.
+ *  - There are no GEM handles; we mint our own u32 handles for the
+ *    pan_kmod handle_to_bo sparse array.
+ *  - For 64-bit clients the kernel forces SAME_VA on all non-executable
+ *    allocations: KBASE_IOCTL_MEM_ALLOC returns a cookie, and mmap()-ing
+ *    the fd at that cookie establishes the mapping, with CPU VA == GPU VA.
+ *    We therefore mmap() every BO right at allocation time and keep that
+ *    mapping until the BO is freed (bo_mmap/bo_munmap ops return/release
+ *    the cached mapping).  munmap() of a SAME_VA region frees the GPU
+ *    mapping too (free-on-close), so bo_free relies on it.
+ *  - GPU-executable BOs come from the EXEC_VA zone (initialised with
+ *    KBASE_IOCTL_MEM_EXEC_INIT at device-open time) and return a real
+ *    GPU VA, which doubles as the mmap offset for CPU access.
+ *  - The GPU address space is implicit (one per context), so vm_create /
  *    vm_bind are thin wrappers that record the VAs assigned by the kernel.
- *  - CPU access to a BO is obtained by mmap()-ing the kbase fd with the GPU VA
- *    as the file offset. bo_get_mmap_offset() therefore returns the GPU VA.
  *  - drmPrimeFDToHandle() does not work on a kbase fd; pan_kmod_bo_import()
  *    will fail gracefully (returns NULL). dma-buf import / WSI is left for
- *    future work.
+ *    future work (KBASE_IOCTL_MEM_IMPORT).
+ *  - Command submission (CSF queue groups / JM job atoms) is not wired up
+ *    yet; this backend currently only supports device enumeration and
+ *    memory management.
  */
 
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 
 #include "util/macros.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
-#include "util/vma.h"
-#include "util/simple_mtx.h"
 #include "util/log.h"
 
 #include "drm-uapi/mali_kbase_ioctl.h"
@@ -44,6 +59,13 @@ const struct pan_kmod_ops kbase_kmod_ops;
 struct kbase_kmod_dev {
    struct pan_kmod_dev base;
 
+   /* True for the CSF flavour of kbase (arch >= 10), false for JM. */
+   bool is_csf;
+
+   /* Tracking page mapped at BASE_MEM_MAP_TRACKING_HANDLE.  Required by
+    * the kernel before any memory operation; unmapped at destroy time. */
+   void *tracking_page;
+
    /* Monotonically-increasing handle counter.
     * kbase has no GEM handles; we mint our own u32 handles for use with the
     * pan_kmod handle_to_bo sparse array. */
@@ -53,21 +75,25 @@ struct kbase_kmod_dev {
 struct kbase_kmod_vm {
    struct pan_kmod_vm base;
 
-   /* Userspace VA heap for AUTO_VA allocations.
-    * kbase assigns VAs automatically via MEM_ALLOC; we record them here so
-    * that pan_kmod callers can read back va.start after vm_bind MAP. */
-   struct {
-      simple_mtx_t lock;
-      struct util_vma_heap heap;
-   } auto_va;
+   /* Nothing kbase-specific: the kernel manages one implicit address space
+    * per context and assigns all VAs itself. */
 };
 
 struct kbase_kmod_bo {
    struct pan_kmod_bo base;
 
-   /* GPU virtual address returned by KBASE_IOCTL_MEM_ALLOC (or MEM_IMPORT).
-    * Also used as the mmap() file offset to obtain a CPU mapping. */
+   /* GPU virtual address.  For SAME_VA allocations this equals the CPU
+    * mapping address; for EXEC_VA-zone allocations it is the address
+    * returned by KBASE_IOCTL_MEM_ALLOC. */
    uint64_t gpu_va;
+
+   /* CPU mapping established at allocation time, valid for the whole BO
+    * lifetime.  bo_mmap returns it; bo_munmap is a no-op. */
+   void *cpu_ptr;
+
+   /* Whether this is a SAME_VA region (freed by munmap()) or a zone
+    * region (freed by KBASE_IOCTL_MEM_FREE). */
+   bool same_va;
 };
 
 /* -------------------------------------------------------------------------
@@ -120,7 +146,7 @@ kbase_get_gpuprops(int fd, size_t *out_size)
 {
    /* First call: size=0 probes the required buffer length. */
    struct kbase_ioctl_get_gpuprops req = { 0 };
-   int ret = drmIoctl(fd, KBASE_IOCTL_GET_GPUPROPS, &req);
+   int ret = ioctl(fd, KBASE_IOCTL_GET_GPUPROPS, &req);
    if (ret < 0) {
       mesa_loge("kbase: KBASE_IOCTL_GET_GPUPROPS (probe) failed: %s",
                 strerror(errno));
@@ -140,7 +166,7 @@ kbase_get_gpuprops(int fd, size_t *out_size)
    req.buffer = (uintptr_t)buf;
    req.size = (uint32_t)size;
 
-   ret = drmIoctl(fd, KBASE_IOCTL_GET_GPUPROPS, &req);
+   ret = ioctl(fd, KBASE_IOCTL_GET_GPUPROPS, &req);
    if (ret < 0) {
       mesa_loge("kbase: KBASE_IOCTL_GET_GPUPROPS (fill) failed: %s",
                 strerror(errno));
@@ -206,14 +232,20 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
    props->mmu_features = (uint32_t)kbase_gpuprop_get(
       buf, buf_size, KBASE_GPUPROP_RAW_MMU_FEATURES, 0);
 
-   for (unsigned i = 0; i < ARRAY_SIZE(props->texture_features); i++) {
+   /* TEXTURE_FEATURES_0..2 are consecutive keys, but TEXTURE_FEATURES_3
+    * was added later and got a non-contiguous key. */
+   STATIC_ASSERT(ARRAY_SIZE(props->texture_features) == 4);
+   for (unsigned i = 0; i < 3; i++) {
       props->texture_features[i] = (uint32_t)kbase_gpuprop_get(
          buf, buf_size,
          KBASE_GPUPROP_RAW_TEXTURE_FEATURES_0 + i, 0);
    }
+   props->texture_features[3] = (uint32_t)kbase_gpuprop_get(
+      buf, buf_size, KBASE_GPUPROP_RAW_TEXTURE_FEATURES_3, 0);
 
-   props->afbc_features = (uint32_t)kbase_gpuprop_get(
-      buf, buf_size, KBASE_GPUPROP_AFBC_FEATURES, 0);
+   /* AFBC_FEATURES has no equivalent in the kbase GPU props blob; panfork
+    * reports 0 for it as well. */
+   props->afbc_features = 0;
 
    /* Thread / core properties */
    props->max_threads_per_core = (uint32_t)kbase_gpuprop_get(
@@ -227,7 +259,7 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
    props->num_registers_per_core = thread_features & 0xffff;
 
    props->max_tls_instance_per_core = (uint32_t)kbase_gpuprop_get(
-      buf, buf_size, KBASE_GPUPROP_THREAD_TLS_ALLOC, 0);
+      buf, buf_size, KBASE_GPUPROP_TLS_ALLOC, 0);
    if (!props->max_tls_instance_per_core)
       props->max_tls_instance_per_core = props->max_threads_per_core;
 
@@ -270,12 +302,13 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
       PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM |
       PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW;
 
-   /* Supported BO flags — WB_MMAP requires cache-sync support which we
-    * leave for future work; skip it for now so flush_bo_map_syncs is a
-    * no-op. */
+   /* Supported BO flags — WB_MMAP requires cache-sync support
+    * (KBASE_IOCTL_MEM_SYNC / BASE_MEM_CACHED_CPU) which we leave for
+    * future work; skip it for now so flush_bo_map_syncs is a no-op. */
    props->supported_bo_flags = PAN_KMOD_BO_FLAG_EXECUTABLE |
                                 PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
-                                PAN_KMOD_BO_FLAG_NO_MMAP;
+                                PAN_KMOD_BO_FLAG_NO_MMAP |
+                                PAN_KMOD_BO_FLAG_GPU_UNCACHED;
 }
 
 /* -------------------------------------------------------------------------
@@ -284,34 +317,55 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
 
 static struct pan_kmod_dev *
 kbase_kmod_dev_create(int fd, uint32_t flags,
-                      const struct pan_kmod_driver *drv_info,
+                      UNUSED const struct pan_kmod_driver *drv_info,
                       const struct pan_kmod_allocator *allocator)
 {
-   /* Version handshake — request at least major=3, minor=0. */
-   struct kbase_ioctl_version_check ver = { .major = 3, .minor = 0 };
-   if (drmIoctl(fd, KBASE_IOCTL_VERSION_CHECK, &ver)) {
-      if (errno == EPERM || errno == EACCES || errno == ENOTTY ||
-          errno == EINVAL || errno == ENODEV) {
-         mesa_logd("kbase: KBASE_IOCTL_VERSION_CHECK probe rejected: %s",
-                   strerror(errno));
-      } else {
-         mesa_loge("kbase: KBASE_IOCTL_VERSION_CHECK failed: %s",
-                   strerror(errno));
+   /* Version handshake.  This must be the very first ioctl on the fd; all
+    * other ioctls return -EPERM until it succeeds.  The CSF flavour
+    * (arch >= 10: G610/G710/...) uses ioctl nr 52, the JM flavour
+    * (arch <= 9) uses nr 0 — and each flavour rejects the other's number
+    * with -EPERM, which is what makes this probe reliable.  We pass 0.0 and
+    * let the kernel report the version it implements (CSF: 1.x, JM: 11.x,
+    * legacy Midgard: 3.x). */
+   struct kbase_ioctl_version_check ver = { 0 };
+   bool is_csf = false;
+
+   if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK_CSF, &ver) == 0) {
+      is_csf = true;
+   } else if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK_JM, &ver) == 0) {
+      is_csf = false;
+
+      if (ver.major < 11) {
+         mesa_loge("kbase: legacy JM driver version %d.%d not supported "
+                   "(need >= 11.0)", ver.major, ver.minor);
+         return NULL;
       }
+   } else {
+      /* Not a usable kbase fd (or a device node we can't handshake with).
+       * This is an expected outcome when probing device nodes, so keep it
+       * quiet. */
+      mesa_logd("kbase: version handshake rejected: %s", strerror(errno));
       return NULL;
    }
 
-   if (ver.major < 3) {
-      mesa_loge("kbase: unsupported kernel driver version %d.%d "
-                "(need >= 3.0)", ver.major, ver.minor);
-      return NULL;
-   }
+   mesa_logd("kbase: %s driver, uAPI version %d.%d",
+             is_csf ? "CSF" : "JM", ver.major, ver.minor);
 
-   /* Set context creation flags.
-    * Use zero flags for maximum compatibility. */
+   /* Set context creation flags.  Zero for maximum compatibility; this also
+    * creates the kernel-side context. */
    struct kbase_ioctl_set_flags set_flags = { .create_flags = 0 };
-   if (drmIoctl(fd, KBASE_IOCTL_SET_FLAGS, &set_flags)) {
+   if (ioctl(fd, KBASE_IOCTL_SET_FLAGS, &set_flags)) {
       mesa_loge("kbase: KBASE_IOCTL_SET_FLAGS failed: %s", strerror(errno));
+      return NULL;
+   }
+
+   /* Map the tracking page.  The kernel requires this before any memory
+    * operation. */
+   void *tracking_page = mmap(NULL, 4096, PROT_NONE, MAP_SHARED, fd,
+                              BASE_MEM_MAP_TRACKING_HANDLE);
+   if (tracking_page == MAP_FAILED) {
+      mesa_loge("kbase: mmap(BASE_MEM_MAP_TRACKING_HANDLE) failed: %s",
+                strerror(errno));
       return NULL;
    }
 
@@ -320,7 +374,17 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    uint8_t *props_buf = kbase_get_gpuprops(fd, &props_size);
    if (!props_buf) {
       mesa_loge("kbase: failed to read GPU properties");
-      return NULL;
+      goto err_unmap_tracking;
+   }
+
+   /* Initialise the EXEC_VA zone so that GPU-executable allocations
+    * (shader BOs) are possible.  4G of executable VA (0x100000 pages)
+    * matches what panfork uses.  Failure is not fatal for enumeration, but
+    * executable allocations will fail later, so warn. */
+   struct kbase_ioctl_mem_exec_init exec_init = { .va_pages = 0x100000 };
+   if (ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec_init)) {
+      mesa_logw("kbase: KBASE_IOCTL_MEM_EXEC_INIT failed: %s "
+                "(executable BO allocation will not work)", strerror(errno));
    }
 
    struct kbase_kmod_dev *kbase_dev =
@@ -328,20 +392,21 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    if (!kbase_dev) {
       mesa_loge("kbase: failed to allocate kbase_kmod_dev");
       free(props_buf);
-      return NULL;
+      goto err_unmap_tracking;
    }
 
-   /* Use a fallback driver version if not provided by pan_kmod_dev_create
-    * (kbase fd is not a DRM fd so drmGetVersion() fails). */
+   /* Report the kernel uAPI version from the handshake (the caller can't
+    * use drmGetVersion() on a kbase fd, so drv_info is either NULL or a
+    * zeroed fallback). */
    struct pan_kmod_driver kbase_drv = {
       .version = { .major = ver.major, .minor = ver.minor },
    };
-   if (drv_info)
-      kbase_drv = *drv_info;
 
    pan_kmod_dev_init(&kbase_dev->base, fd, flags, &kbase_drv,
                      &kbase_kmod_ops, allocator);
 
+   kbase_dev->is_csf = is_csf;
+   kbase_dev->tracking_page = tracking_page;
    kbase_dev->next_handle = 1;
 
    kbase_dev_query_props(kbase_dev, props_buf, props_size);
@@ -349,12 +414,17 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
 
    if (!kbase_dev->base.props.gpu_id) {
       mesa_loge("kbase: failed to determine GPU ID from properties");
+      munmap(tracking_page, 4096);
       pan_kmod_dev_cleanup(&kbase_dev->base);
       pan_kmod_free(allocator, kbase_dev);
       return NULL;
    }
 
    return &kbase_dev->base;
+
+err_unmap_tracking:
+   munmap(tracking_page, 4096);
+   return NULL;
 }
 
 static void
@@ -362,6 +432,9 @@ kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
 {
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
+
+   if (kbase_dev->tracking_page)
+      munmap(kbase_dev->tracking_page, 4096);
 
    pan_kmod_dev_cleanup(dev);
    pan_kmod_free(dev->allocator, kbase_dev);
@@ -399,24 +472,36 @@ kbase_kmod_dev_query_user_va_range(const struct pan_kmod_dev *dev)
 static uint64_t
 to_kbase_mem_flags(uint32_t kmod_flags)
 {
-   uint64_t flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR;
+   uint64_t flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                    BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR;
 
-   /* CPU access is needed unless the caller explicitly asks for a GPU-only
-    * buffer. */
-   if (!(kmod_flags & PAN_KMOD_BO_FLAG_NO_MMAP))
-      flags |= BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR;
+   /* Keep GPU cores coherent with each other (panfork does the same). */
+   flags |= BASE_MEM_COHERENT_LOCAL;
 
-   if (kmod_flags & PAN_KMOD_BO_FLAG_EXECUTABLE)
+   if (kmod_flags & PAN_KMOD_BO_FLAG_EXECUTABLE) {
+      /* The kernel rejects GPU_EX|GPU_WR (W^X), and executable regions
+       * must come from the EXEC_VA zone rather than SAME_VA. */
       flags |= BASE_MEM_PROT_GPU_EX;
-
-   if (kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT)
-      flags |= BASE_MEM_GROW_ON_GPF;
+      flags &= ~BASE_MEM_PROT_GPU_WR;
+   } else {
+      /* The kernel forces SAME_VA on non-executable allocations from
+       * 64-bit clients anyway; request it explicitly so the behavior is
+       * uniform. */
+      flags |= BASE_MEM_SAME_VA;
+   }
 
    if (kmod_flags & PAN_KMOD_BO_FLAG_GPU_UNCACHED)
       flags |= BASE_MEM_UNCACHED_GPU;
 
    if (kmod_flags & PAN_KMOD_BO_FLAG_IO_COHERENT)
       flags |= BASE_MEM_COHERENT_SYSTEM;
+
+   if (kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT)
+      flags |= BASE_MEM_GROW_ON_GPF;
+
+   /* Note: no BASE_MEM_CACHED_CPU — CPU mappings are write-combine until
+    * cache maintenance (KBASE_IOCTL_MEM_SYNC) is wired up, which keeps
+    * things coherent without any flush support. */
 
    return flags;
 }
@@ -429,11 +514,8 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
 
-   uint64_t page_size = 4096;
+   const uint64_t page_size = 4096;
    uint64_t va_pages = (size + page_size - 1) / page_size;
-   /* For growable (ALLOC_ON_FAULT) buffers commit nothing up-front. */
-   uint64_t commit_pages = (kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT)
-                              ? 0 : va_pages;
 
    struct kbase_kmod_bo *kbase_bo =
       pan_kmod_dev_alloc(dev, sizeof(*kbase_bo));
@@ -444,20 +526,49 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
 
    union kbase_ioctl_mem_alloc req = {
       .in = {
-         .va_pages      = va_pages,
-         .commit_pages  = commit_pages,
-         .extent        = (kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT)
-                             ? va_pages : 0,
-         .flags         = to_kbase_mem_flags(kmod_flags),
+         .va_pages     = va_pages,
+         .commit_pages = va_pages,
+         .flags        = to_kbase_mem_flags(kmod_flags),
       },
    };
 
-   if (drmIoctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &req)) {
+   if (kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT) {
+      /* Growable region: nothing committed up-front, grown in 2 MB
+       * increments on GPU page fault (matches panfork's heap setup). */
+      req.in.commit_pages = 0;
+      req.in.extension = (2 * 1024 * 1024) / page_size;
+   }
+
+   if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &req)) {
       mesa_loge("kbase: KBASE_IOCTL_MEM_ALLOC failed: %s", strerror(errno));
       goto err_free_bo;
    }
 
-   kbase_bo->gpu_va = req.out.gpu_va;
+   kbase_bo->same_va = (req.out.flags & BASE_MEM_SAME_VA) != 0;
+
+   /* Establish the CPU mapping right away:
+    *  - for SAME_VA regions out.gpu_va is a cookie, and this mmap() is what
+    *    actually creates the region mapping — the returned CPU address IS
+    *    the GPU VA;
+    *  - for EXEC_VA-zone regions out.gpu_va is already a real GPU VA that
+    *    doubles as the mmap offset.
+    * The mapping is kept for the whole BO lifetime (see bo_mmap/bo_munmap).
+    */
+   void *cpu_ptr = mmap(NULL, va_pages * page_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, dev->fd, req.out.gpu_va);
+   if (cpu_ptr == MAP_FAILED) {
+      mesa_loge("kbase: mmap of BO (cookie/VA 0x%" PRIx64 ", size %" PRIu64
+                ") failed: %s", (uint64_t)req.out.gpu_va,
+                va_pages * page_size, strerror(errno));
+
+      /* MEM_FREE works on both real VAs and pending cookies. */
+      struct kbase_ioctl_mem_free free_req = { .gpu_addr = req.out.gpu_va };
+      ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &free_req);
+      goto err_free_bo;
+   }
+
+   kbase_bo->cpu_ptr = cpu_ptr;
+   kbase_bo->gpu_va = kbase_bo->same_va ? (uintptr_t)cpu_ptr : req.out.gpu_va;
 
    /* Allocate a unique u32 handle for the pan_kmod handle_to_bo table. */
    uint32_t handle = p_atomic_inc_return(&kbase_dev->next_handle);
@@ -479,9 +590,18 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
 
    pan_kmod_bo_cleanup(bo);
 
-   struct kbase_ioctl_mem_free req = { .gpu_addr = kbase_bo->gpu_va };
-   if (drmIoctl(bo->dev->fd, KBASE_IOCTL_MEM_FREE, &req))
-      mesa_loge("kbase: KBASE_IOCTL_MEM_FREE failed: %s", strerror(errno));
+   /* For SAME_VA regions, munmap() alone tears the whole region down
+    * (free-on-close); a MEM_FREE afterwards would hit a stale VA.  For
+    * zone regions (EXEC_VA), munmap() only drops the CPU mapping and the
+    * region must be freed explicitly. */
+   if (kbase_bo->cpu_ptr)
+      munmap(kbase_bo->cpu_ptr, bo->size);
+
+   if (!kbase_bo->same_va) {
+      struct kbase_ioctl_mem_free req = { .gpu_addr = kbase_bo->gpu_va };
+      if (ioctl(bo->dev->fd, KBASE_IOCTL_MEM_FREE, &req))
+         mesa_loge("kbase: KBASE_IOCTL_MEM_FREE failed: %s", strerror(errno));
+   }
 
    pan_kmod_dev_free(bo->dev, kbase_bo);
 }
@@ -501,13 +621,49 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size)
    return NULL;
 }
 
-/* In kbase the GPU VA is used directly as the mmap() file offset. */
+/* The GPU VA doubles as the mmap() file offset in kbase, but BOs are mapped
+ * once at allocation time and bo_mmap below returns the cached mapping, so
+ * this is only kept as a fallback. */
 static off_t
 kbase_kmod_bo_get_mmap_offset(struct pan_kmod_bo *bo)
 {
    struct kbase_kmod_bo *kbase_bo =
       container_of(bo, struct kbase_kmod_bo, base);
    return (off_t)kbase_bo->gpu_va;
+}
+
+/* Return the CPU mapping established at allocation time.  A SAME_VA region
+ * has exactly one CPU mapping (its address is the GPU VA), so we cannot
+ * honor requests for a caller-chosen address. */
+static void *
+kbase_kmod_bo_mmap(struct pan_kmod_bo *bo, UNUSED int prot, UNUSED int flags,
+                   void *host_addr)
+{
+   struct kbase_kmod_bo *kbase_bo =
+      container_of(bo, struct kbase_kmod_bo, base);
+
+   if (host_addr != NULL && host_addr != kbase_bo->cpu_ptr) {
+      mesa_loge("kbase: mapping a BO at a caller-chosen address is not "
+                "supported (SAME_VA)");
+      errno = ENOTSUP;
+      return MAP_FAILED;
+   }
+
+   if (!kbase_bo->cpu_ptr) {
+      errno = EINVAL;
+      return MAP_FAILED;
+   }
+
+   return kbase_bo->cpu_ptr;
+}
+
+/* The mapping belongs to the BO and lives until bo_free: unmapping a
+ * SAME_VA region would free its GPU mapping too. */
+static int
+kbase_kmod_bo_munmap(UNUSED struct pan_kmod_bo *bo, UNUSED void *host_addr,
+                     UNUSED size_t size)
+{
+   return 0;
 }
 
 /* kbase does not expose per-BO fence objects.
@@ -551,15 +707,13 @@ kbase_kmod_bo_make_unevictable(UNUSED struct pan_kmod_bo *bo)
 /* -------------------------------------------------------------------------
  * VM (GPU address space) management
  *
- * kbase automatically provides one GPU address space per context.  There is
- * no kernel ioctl to explicitly create/destroy a VM.
+ * kbase provides exactly one GPU address space per context and assigns all
+ * VAs itself (SAME_VA: the CPU mapping address; EXEC_VA: kernel-chosen).
+ * There is no kernel object to create/destroy, so the VM is pure
+ * bookkeeping:
  *
- * vm_create allocates a bookkeeping structure and (for AUTO_VA) a userspace
- * VMA heap that mirrors the range the kernel will assign allocations in.
- *
- * vm_bind MAP: records the GPU VA already assigned by KBASE_IOCTL_MEM_ALLOC.
- * vm_bind UNMAP: no-op; the unmap happens automatically when bo_free calls
- *                KBASE_IOCTL_MEM_FREE.
+ * vm_bind MAP: reports the GPU VA already assigned at allocation time.
+ * vm_bind UNMAP: no-op; the unmap happens when the BO is freed.
  * ---------------------------------------------------------------------- */
 
 static struct pan_kmod_vm *
@@ -573,11 +727,6 @@ kbase_kmod_vm_create(struct pan_kmod_dev *dev, uint32_t flags,
       return NULL;
    }
 
-   if (flags & PAN_KMOD_VM_FLAG_AUTO_VA) {
-      simple_mtx_init(&kbase_vm->auto_va.lock, mtx_plain);
-      util_vma_heap_init(&kbase_vm->auto_va.heap, va_start, va_range);
-   }
-
    pan_kmod_vm_init(&kbase_vm->base, dev, 0 /* no kernel handle */,
                     flags, PAN_PGSIZE_4K);
    return &kbase_vm->base;
@@ -588,11 +737,6 @@ kbase_kmod_vm_destroy(struct pan_kmod_vm *vm)
 {
    struct kbase_kmod_vm *kbase_vm =
       container_of(vm, struct kbase_kmod_vm, base);
-
-   if (vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA) {
-      simple_mtx_destroy(&kbase_vm->auto_va.lock);
-      util_vma_heap_finish(&kbase_vm->auto_va.heap);
-   }
 
    pan_kmod_dev_free(vm->dev, kbase_vm);
 }
@@ -612,14 +756,22 @@ kbase_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
       if (op->type == PAN_KMOD_VM_OP_TYPE_MAP) {
          struct kbase_kmod_bo *kbase_bo =
             container_of(op->map.bo, struct kbase_kmod_bo, base);
+         uint64_t va = kbase_bo->gpu_va + op->map.bo_offset;
 
-         /* kbase assigns the GPU VA at alloc time (MEM_ALLOC).  There is no
-          * separate map operation.  Report the VA back to the caller whether
-          * they asked for AUTO_VA or an explicit address. */
-         op->va.start = kbase_bo->gpu_va;
-
+         if (op->va.start == PAN_KMOD_VM_MAP_AUTO_VA) {
+            /* kbase assigned the VA at alloc time; report it back. */
+            op->va.start = va;
+         } else if (op->va.start != va) {
+            /* Mapping at a caller-chosen address is impossible in kbase
+             * (no vm_bind equivalent).  Fail loudly rather than letting
+             * the caller use a VA the GPU doesn't know about. */
+            mesa_loge("kbase: cannot map BO at explicit VA 0x%" PRIx64
+                      " (kbase-assigned VA is 0x%" PRIx64 ")",
+                      op->va.start, va);
+            return -1;
+         }
       } else if (op->type == PAN_KMOD_VM_OP_TYPE_UNMAP) {
-         /* Unmap happens automatically at bo_free time via MEM_FREE. */
+         /* Unmap happens automatically when the BO is freed. */
       } else if (op->type == PAN_KMOD_VM_OP_TYPE_SYNC_ONLY) {
          /* No-op. */
       }
@@ -642,11 +794,11 @@ kbase_kmod_vm_query_state(struct pan_kmod_vm *vm)
 static uint64_t
 kbase_kmod_query_timestamp(const struct pan_kmod_dev *dev)
 {
-   struct kbase_ioctl_get_cpu_gpu_timeinfo req = {
+   union kbase_ioctl_get_cpu_gpu_timeinfo req = {
       .in.request_flags = BASE_TIMEINFO_TIMESTAMP_FLAG,
    };
 
-   if (drmIoctl(dev->fd, KBASE_IOCTL_GET_CPU_GPU_TIMEINFO, &req) == 0)
+   if (ioctl(dev->fd, KBASE_IOCTL_GET_CPU_GPU_TIMEINFO, &req) == 0)
       return req.out.timestamp;
 
    return 0;
@@ -675,6 +827,8 @@ const struct pan_kmod_ops kbase_kmod_ops = {
    .bo_free                = kbase_kmod_bo_free,
    .bo_import              = kbase_kmod_bo_import,
    .bo_get_mmap_offset     = kbase_kmod_bo_get_mmap_offset,
+   .bo_mmap                = kbase_kmod_bo_mmap,
+   .bo_munmap              = kbase_kmod_bo_munmap,
    .flush_bo_map_syncs     = kbase_kmod_flush_bo_map_syncs,
    .bo_wait                = kbase_kmod_bo_wait,
    .bo_make_evictable      = kbase_kmod_bo_make_evictable,

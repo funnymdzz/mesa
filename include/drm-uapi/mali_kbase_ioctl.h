@@ -1,13 +1,23 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
- * Copyright (C) 2014-2024 ARM Ltd
- * SPDX-License-Identifier: MIT
+ * Copyright (C) 2010-2023 ARM Limited. All rights reserved.
  *
- * ARM Mali kbase userspace API definitions.
- * Targets the ARM Bifrost/Valhall kernel driver r32p0–r44p0.
+ * ARM Mali kbase kernel driver userspace API definitions.
+ * Assembled from the Arm Bifrost/Valhall kbase uAPI headers
+ * (mali_kbase_ioctl.h, mali_kbase_jm_ioctl.h, mali_kbase_csf_ioctl.h,
+ * mali_base_kernel.h, mali_kbase_gpuprops.h), matching kernel driver
+ * releases r32p0–r44p0.  Values cross-checked against the panfork
+ * userspace driver and the Rockchip/Google shipping kernel sources.
  *
- * NOTE: ioctl numbers and struct layouts must be verified against the exact
- * kernel driver version in use on the target system. The definitions here are
- * based on the publicly-available r44p0 release.
+ * Note: the kbase driver comes in two flavours with partially different
+ * ioctl numbering:
+ *  - JM (Job Manager, Midgard/Bifrost/Valhall arch <= 9):
+ *    VERSION_CHECK is ioctl nr 0, uAPI version 11.x.
+ *  - CSF (Command Stream Frontend, Valhall arch >= 10, e.g. G610/G710):
+ *    VERSION_CHECK is ioctl nr 52 (nr 0 is reserved and returns -EPERM),
+ *    uAPI version 1.x.
+ * All ioctls other than the flavour's VERSION_CHECK return -EPERM until
+ * the VERSION_CHECK + SET_FLAGS handshake has completed.
  */
 
 #pragma once
@@ -15,37 +25,39 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-/* The ioctl type for all kbase ioctls */
 #define KBASE_IOCTL_TYPE 0x80
 
 /* -----------------------------------------------------------------------
- * Version handshake — first ioctl to call on a fresh /dev/mali* fd.
- * The kernel fills in the version it supports. Accept if major matches.
+ * Version handshake — must be the first ioctl on a fresh /dev/mali* fd.
+ * Input is the version userspace was built against (may be zero); the
+ * kernel writes back the version it implements and records it.
  * ----------------------------------------------------------------------- */
 struct kbase_ioctl_version_check {
    __u16 major;
    __u16 minor;
 };
-#define KBASE_IOCTL_VERSION_CHECK \
+/* JM flavour (also accepted by ancient Midgard drivers, which report 3.x) */
+#define KBASE_IOCTL_VERSION_CHECK_JM \
    _IOWR(KBASE_IOCTL_TYPE, 0, struct kbase_ioctl_version_check)
+/* CSF flavour */
+#define KBASE_IOCTL_VERSION_CHECK_CSF \
+   _IOWR(KBASE_IOCTL_TYPE, 52, struct kbase_ioctl_version_check)
 
 /* -----------------------------------------------------------------------
- * Set context-creation flags.
+ * Set context-creation flags.  Second step of the handshake.
  * ----------------------------------------------------------------------- */
 struct kbase_ioctl_set_flags {
    __u32 create_flags;
 };
-/* Flags for create_flags */
-#define BASE_CONTEXT_CCTX_EMBEDDED       ((__u32)1)
-#define BASE_CONTEXT_CSF_EVENT_THREAD    ((__u32)(1 << 2))
-#define BASE_CONTEXT_SYSTEM_MONITOR_SUBMIT_DISABLED ((__u32)(1 << 3))
+#define BASE_CONTEXT_CREATE_FLAG_NONE               0
+#define BASE_CONTEXT_CCTX_EMBEDDED                  ((__u32)1 << 0)
+#define BASE_CONTEXT_SYSTEM_MONITOR_SUBMIT_DISABLED ((__u32)1 << 1)
 
 #define KBASE_IOCTL_SET_FLAGS \
    _IOW(KBASE_IOCTL_TYPE, 1, struct kbase_ioctl_set_flags)
 
 /* -----------------------------------------------------------------------
- * Job submit (JM GPUs, arch < 10).
- * Not used by the kmod layer directly; retained for completeness.
+ * Job submission (JM GPUs only, arch <= 9).
  * ----------------------------------------------------------------------- */
 struct kbase_ioctl_job_submit {
    __u64 addr;
@@ -57,9 +69,8 @@ struct kbase_ioctl_job_submit {
 
 /* -----------------------------------------------------------------------
  * Query GPU properties.
- * On success the ioctl returns the byte-length of the property blob.
- * Call with size=0 / buffer=0 to probe the required length, then
- * allocate and call again.
+ * Call with size=0 to probe the blob length (returned as the positive
+ * ioctl return value), then allocate and call again with buffer/size set.
  * ----------------------------------------------------------------------- */
 struct kbase_ioctl_get_gpuprops {
    __u64 buffer;
@@ -69,65 +80,85 @@ struct kbase_ioctl_get_gpuprops {
 #define KBASE_IOCTL_GET_GPUPROPS \
    _IOW(KBASE_IOCTL_TYPE, 3, struct kbase_ioctl_get_gpuprops)
 
-/* -----------------------------------------------------------------------
- * GPU property key IDs used in the serialised blob returned by
- * KBASE_IOCTL_GET_GPUPROPS.  Each entry is encoded as:
- *
- *   [ 4-byte header: (key << 2) | size_code ]  [ value bytes ]
- *
+/* GPU property keys used in the serialised blob returned by GET_GPUPROPS.
+ * Each entry is encoded as:
+ *   [ 4-byte little-endian header: (key << 2) | size_code ]  [ value ]
  *   size_code: 0 = u8, 1 = u16, 2 = u32, 3 = u64
- *
- * The values below are from the ARM Bifrost/Valhall r44p0 source tree.
- * They may differ slightly on older driver releases.
- * ----------------------------------------------------------------------- */
-
-/* Core computed properties */
-#define KBASE_GPUPROP_PRODUCT_ID            1   /* u32 */
-#define KBASE_GPUPROP_VERSION_STATUS        2   /* u32 */
-#define KBASE_GPUPROP_MINOR_REVISION        3   /* u32 */
-#define KBASE_GPUPROP_MAJOR_REVISION        4   /* u32 */
-
-/* Raw GPU register mirror values */
-#define KBASE_GPUPROP_RAW_SHADER_PRESENT    56  /* u64 */
-#define KBASE_GPUPROP_RAW_TILER_PRESENT     57  /* u64 */
-#define KBASE_GPUPROP_RAW_L2_PRESENT        58  /* u64 */
-#define KBASE_GPUPROP_RAW_STACK_PRESENT     59  /* u64 */
-#define KBASE_GPUPROP_RAW_L2_FEATURES       60  /* u32 */
-#define KBASE_GPUPROP_RAW_CORE_FEATURES     61  /* u32 */
-#define KBASE_GPUPROP_RAW_TILER_FEATURES    62  /* u32 */
-#define KBASE_GPUPROP_RAW_MEM_FEATURES      63  /* u32 */
-#define KBASE_GPUPROP_RAW_MMU_FEATURES      64  /* u32 */
-#define KBASE_GPUPROP_RAW_AS_PRESENT        65  /* u32 */
-#define KBASE_GPUPROP_RAW_JS_PRESENT        66  /* u32 */
-/* JS_FEATURES_0..15 occupy keys 67-82 */
-#define KBASE_GPUPROP_RAW_TEXTURE_FEATURES_0  83 /* u32 */
-#define KBASE_GPUPROP_RAW_TEXTURE_FEATURES_1  84 /* u32 */
-#define KBASE_GPUPROP_RAW_TEXTURE_FEATURES_2  85 /* u32 */
-#define KBASE_GPUPROP_RAW_TEXTURE_FEATURES_3  86 /* u32 */
-#define KBASE_GPUPROP_RAW_GPU_ID            87  /* u32: top-16-bit product + bottom-16-bit rev */
-#define KBASE_GPUPROP_RAW_THREAD_MAX_THREADS 88  /* u32 */
-#define KBASE_GPUPROP_RAW_THREAD_MAX_WORKGROUP_SIZE 89 /* u32 */
-#define KBASE_GPUPROP_RAW_THREAD_MAX_BARRIER_SIZE   90 /* u32 */
-#define KBASE_GPUPROP_RAW_THREAD_FEATURES   91  /* u32 */
-#define KBASE_GPUPROP_RAW_COHERENCY_MODE    92  /* u32 */
-
-/* Thread properties (computed) */
-#define KBASE_GPUPROP_THREAD_TLS_ALLOC      93  /* u32 */
-#define KBASE_GPUPROP_AFBC_FEATURES         94  /* u32 */
+ */
+#define KBASE_GPUPROP_PRODUCT_ID                    1
+#define KBASE_GPUPROP_VERSION_STATUS                2
+#define KBASE_GPUPROP_MINOR_REVISION                3
+#define KBASE_GPUPROP_MAJOR_REVISION                4
+/* 5 previously used for GPU speed */
+#define KBASE_GPUPROP_GPU_FREQ_KHZ_MAX              6
+/* 7 previously used for minimum GPU speed */
+#define KBASE_GPUPROP_LOG2_PROGRAM_COUNTER_SIZE     8
+#define KBASE_GPUPROP_TEXTURE_FEATURES_0            9
+#define KBASE_GPUPROP_TEXTURE_FEATURES_1            10
+#define KBASE_GPUPROP_TEXTURE_FEATURES_2            11
+#define KBASE_GPUPROP_GPU_AVAILABLE_MEMORY_SIZE     12
+#define KBASE_GPUPROP_L2_LOG2_LINE_SIZE             13
+#define KBASE_GPUPROP_L2_LOG2_CACHE_SIZE            14
+#define KBASE_GPUPROP_L2_NUM_L2_SLICES              15
+#define KBASE_GPUPROP_TILER_BIN_SIZE_BYTES          16
+#define KBASE_GPUPROP_TILER_MAX_ACTIVE_LEVELS       17
+#define KBASE_GPUPROP_MAX_THREADS                   18
+#define KBASE_GPUPROP_MAX_WORKGROUP_SIZE            19
+#define KBASE_GPUPROP_MAX_BARRIER_SIZE              20
+#define KBASE_GPUPROP_MAX_REGISTERS                 21
+#define KBASE_GPUPROP_MAX_TASK_QUEUE                22
+#define KBASE_GPUPROP_MAX_THREAD_GROUP_SPLIT        23
+#define KBASE_GPUPROP_IMPL_TECH                     24
+#define KBASE_GPUPROP_RAW_SHADER_PRESENT            25
+#define KBASE_GPUPROP_RAW_TILER_PRESENT             26
+#define KBASE_GPUPROP_RAW_L2_PRESENT                27
+#define KBASE_GPUPROP_RAW_STACK_PRESENT             28
+#define KBASE_GPUPROP_RAW_L2_FEATURES               29
+#define KBASE_GPUPROP_RAW_CORE_FEATURES             30
+#define KBASE_GPUPROP_RAW_MEM_FEATURES              31
+#define KBASE_GPUPROP_RAW_MMU_FEATURES              32
+#define KBASE_GPUPROP_RAW_AS_PRESENT                33
+#define KBASE_GPUPROP_RAW_JS_PRESENT                34
+#define KBASE_GPUPROP_RAW_JS_FEATURES_0             35
+/* JS_FEATURES_1..15 occupy keys 36..50 */
+#define KBASE_GPUPROP_RAW_TILER_FEATURES            51
+#define KBASE_GPUPROP_RAW_TEXTURE_FEATURES_0        52
+#define KBASE_GPUPROP_RAW_TEXTURE_FEATURES_1        53
+#define KBASE_GPUPROP_RAW_TEXTURE_FEATURES_2        54
+#define KBASE_GPUPROP_RAW_GPU_ID                    55
+#define KBASE_GPUPROP_RAW_THREAD_MAX_THREADS        56
+#define KBASE_GPUPROP_RAW_THREAD_MAX_WORKGROUP_SIZE 57
+#define KBASE_GPUPROP_RAW_THREAD_MAX_BARRIER_SIZE   58
+#define KBASE_GPUPROP_RAW_THREAD_FEATURES           59
+#define KBASE_GPUPROP_RAW_COHERENCY_MODE            60
+#define KBASE_GPUPROP_COHERENCY_NUM_GROUPS          61
+#define KBASE_GPUPROP_COHERENCY_NUM_CORE_GROUPS     62
+#define KBASE_GPUPROP_COHERENCY_COHERENCY           63
+#define KBASE_GPUPROP_COHERENCY_GROUP_0             64
+/* COHERENCY_GROUP_1..15 occupy keys 65..79 */
+#define KBASE_GPUPROP_TEXTURE_FEATURES_3            80
+#define KBASE_GPUPROP_RAW_TEXTURE_FEATURES_3        81
+#define KBASE_GPUPROP_NUM_EXEC_ENGINES              82
+#define KBASE_GPUPROP_RAW_THREAD_TLS_ALLOC          83
+#define KBASE_GPUPROP_TLS_ALLOC                     84
+#define KBASE_GPUPROP_RAW_GPU_FEATURES              85
 
 /* -----------------------------------------------------------------------
  * Memory allocation.
- * va_pages: number of pages to reserve in the GPU address space.
- * commit_pages: pages backed at allocation time (can be <= va_pages).
- * extent: growth granularity for GROW_ON_GPF allocations.
- * flags: combination of BASE_MEM_* flags.
- * On success the output half contains the assigned GPU VA and actual flags.
+ *
+ * For 64-bit clients the kernel forces BASE_MEM_SAME_VA on all allocations
+ * that are not GPU-executable (EXEC_VA zone) or FIXED/FIXABLE.  For SAME_VA
+ * allocations out.gpu_va is NOT a GPU address but a mmap cookie: mmap()-ing
+ * the kbase fd at that offset establishes the mapping, and the CPU address
+ * returned by mmap() becomes both the CPU and the GPU VA of the region.
+ * Non-SAME_VA allocations return a real GPU VA which can also be used as
+ * the mmap offset to obtain a CPU mapping.
  * ----------------------------------------------------------------------- */
 union kbase_ioctl_mem_alloc {
    struct {
       __u64 va_pages;
       __u64 commit_pages;
-      __u64 extent;
+      __u64 extension;
       __u64 flags;
    } in;
    struct {
@@ -138,26 +169,37 @@ union kbase_ioctl_mem_alloc {
 #define KBASE_IOCTL_MEM_ALLOC \
    _IOWR(KBASE_IOCTL_TYPE, 5, union kbase_ioctl_mem_alloc)
 
-/* Memory allocation flags (BASE_MEM_*) */
-#define BASE_MEM_PROT_CPU_RD        ((__u64)(1ULL <<  0))
-#define BASE_MEM_PROT_CPU_WR        ((__u64)(1ULL <<  1))
-#define BASE_MEM_PROT_GPU_RD        ((__u64)(1ULL <<  2))
-#define BASE_MEM_PROT_GPU_WR        ((__u64)(1ULL <<  3))
-#define BASE_MEM_PROT_GPU_EX        ((__u64)(1ULL <<  4))
-#define BASE_MEM_GROW_ON_GPF        ((__u64)(1ULL <<  9))
-#define BASE_MEM_DONT_NEED          ((__u64)(1ULL << 11))
-#define BASE_MEM_IMPORT_SHARED      ((__u64)(1ULL << 13))
-#define BASE_MEM_COHERENT_SYSTEM    ((__u64)(1ULL << 14))
-#define BASE_MEM_CACHED_CPU         ((__u64)(1ULL << 15))
-#define BASE_MEM_TILER_ALIGN_TOP    ((__u64)(1ULL << 16))
-#define BASE_MEM_UNCACHED_GPU       ((__u64)(1ULL << 17))
-#define BASE_MEM_PERMANENT_KERNEL_MAPPING ((__u64)(1ULL << 19))
-#define BASE_MEM_KERNEL_SYNC        ((__u64)(1ULL << 20))
-#define BASE_MEM_NO_USER_FREE       ((__u64)(1ULL << 21))
-#define BASE_MEM_FIXED              ((__u64)(1ULL << 27))
+/* Memory allocation/import flags (base_mem_alloc_flags) */
+#define BASE_MEM_PROT_CPU_RD              ((__u64)1 << 0)
+#define BASE_MEM_PROT_CPU_WR              ((__u64)1 << 1)
+#define BASE_MEM_PROT_GPU_RD              ((__u64)1 << 2)
+#define BASE_MEM_PROT_GPU_WR              ((__u64)1 << 3)
+#define BASE_MEM_PROT_GPU_EX              ((__u64)1 << 4)
+#define BASE_MEM_GPU_VA_SAME_4GB_PAGE     ((__u64)1 << 6)
+#define BASE_MEM_GROW_ON_GPF              ((__u64)1 << 9)
+#define BASE_MEM_COHERENT_SYSTEM          ((__u64)1 << 10)
+#define BASE_MEM_COHERENT_LOCAL           ((__u64)1 << 11)
+#define BASE_MEM_CACHED_CPU               ((__u64)1 << 12)
+#define BASE_MEM_SAME_VA                  ((__u64)1 << 13)
+#define BASE_MEM_NEED_MMAP                ((__u64)1 << 14)
+#define BASE_MEM_COHERENT_SYSTEM_REQUIRED ((__u64)1 << 15)
+#define BASE_MEM_PROTECTED                ((__u64)1 << 16)
+#define BASE_MEM_DONT_NEED                ((__u64)1 << 17)
+#define BASE_MEM_IMPORT_SHARED            ((__u64)1 << 18)
+#define BASE_MEM_CSF_EVENT                ((__u64)1 << 19) /* CSF only */
+#define BASE_MEM_UNCACHED_GPU             ((__u64)1 << 21)
+#define BASE_MEM_IMPORT_SYNC_ON_MAP_UNMAP ((__u64)1 << 26)
+#define BASE_MEM_KERNEL_SYNC              ((__u64)1 << 28)
+
+/* Special mmap offsets ("memory handles"), in bytes (4K page based) */
+#define BASE_MEM_MAP_TRACKING_HANDLE          (3ull << 12)
+#define BASEP_MEM_CSF_USER_REG_PAGE_HANDLE    (47ull << 12) /* CSF only */
+#define BASEP_MEM_CSF_USER_IO_PAGES_HANDLE    (48ull << 12) /* CSF only */
+#define BASE_MEM_COOKIE_BASE                  (64ull << 12)
+#define BASE_MEM_FIRST_FREE_ADDRESS           ((64ull + 64ull) << 12)
 
 /* -----------------------------------------------------------------------
- * Memory query — query flags/size of an existing allocation.
+ * Memory query — query properties of an existing allocation.
  * ----------------------------------------------------------------------- */
 union kbase_ioctl_mem_query {
    struct {
@@ -171,8 +213,14 @@ union kbase_ioctl_mem_query {
 #define KBASE_IOCTL_MEM_QUERY \
    _IOWR(KBASE_IOCTL_TYPE, 6, union kbase_ioctl_mem_query)
 
+#define KBASE_MEM_QUERY_COMMIT_SIZE ((__u64)1)
+#define KBASE_MEM_QUERY_VA_SIZE     ((__u64)2)
+#define KBASE_MEM_QUERY_FLAGS       ((__u64)3)
+
 /* -----------------------------------------------------------------------
- * Memory free — release an allocation previously created by MEM_ALLOC.
+ * Memory free.
+ * For SAME_VA regions the region is also torn down when the CPU mapping
+ * is munmap()ed (free-on-close), in which case MEM_FREE must not be called.
  * ----------------------------------------------------------------------- */
 struct kbase_ioctl_mem_free {
    __u64 gpu_addr;
@@ -181,70 +229,49 @@ struct kbase_ioctl_mem_free {
    _IOW(KBASE_IOCTL_TYPE, 7, struct kbase_ioctl_mem_free)
 
 /* -----------------------------------------------------------------------
- * CPU–GPU cache synchronisation.
- * handle: GPU VA of the allocation.
- * user_addr: CPU virtual address of the mapped region.
- * size: byte length to sync.
- * type: direction (see KBASE_SYNC_* below).
+ * Just-in-time memory allocator initialisation (modern >= 11.20 layout).
  * ----------------------------------------------------------------------- */
-struct kbase_ioctl_sync {
+struct kbase_ioctl_mem_jit_init {
+   __u64 va_pages;
+   __u8 max_allocations;
+   __u8 trim_level;
+   __u8 group_id;
+   __u8 padding[5];
+   __u64 phys_pages;
+};
+#define KBASE_IOCTL_MEM_JIT_INIT \
+   _IOW(KBASE_IOCTL_TYPE, 14, struct kbase_ioctl_mem_jit_init)
+
+/* -----------------------------------------------------------------------
+ * CPU cache maintenance on a mapped region.
+ * ----------------------------------------------------------------------- */
+struct kbase_ioctl_mem_sync {
    __u64 handle;
    __u64 user_addr;
    __u64 size;
-   __u32 type;
-   __u32 padding;
+   __u8 type;
+   __u8 padding[7];
 };
-/* Sync direction */
-#define KBASE_SYNC_TO_CPU    0
-#define KBASE_SYNC_TO_DEVICE 1
+#define BASE_SYNCSET_OP_MSYNC 1 /* clean to memory */
+#define BASE_SYNCSET_OP_CSYNC 2 /* invalidate from memory */
 
-#define KBASE_IOCTL_SYNC \
-   _IOW(KBASE_IOCTL_TYPE, 8, struct kbase_ioctl_sync)
+#define KBASE_IOCTL_MEM_SYNC \
+   _IOW(KBASE_IOCTL_TYPE, 15, struct kbase_ioctl_mem_sync)
 
 /* -----------------------------------------------------------------------
- * Memory import — map an external buffer (e.g. dma-buf) into the GPU
- * address space.
- * phandle: file descriptor (for UMM/dma-buf type).
- * type: one of BASE_MEM_IMPORT_TYPE_*.
- * flags: BASE_MEM_* access flags.
- * On success the output half contains the GPU VA, actual flags, and page count.
- * ----------------------------------------------------------------------- */
-union kbase_ioctl_mem_import {
-   struct {
-      __u64 phandle;
-      __u32 type;
-      __u32 padding;
-      __u64 flags;
-   } in;
-   struct {
-      __u64 flags;
-      __u64 gpu_va;
-      __u64 va_pages;
-   } out;
-};
-/* Import types */
-#define BASE_MEM_IMPORT_TYPE_INVALID  0
-#define BASE_MEM_IMPORT_TYPE_UMM      2 /* dma-buf (UMM = Unified Memory Model) */
-#define BASE_MEM_IMPORT_TYPE_USER_BUFFER 3
-#define BASE_MEM_IMPORT_TYPE_ANDROID_HARDWARE_BUFFER 4
-
-#define KBASE_IOCTL_MEM_IMPORT \
-   _IOWR(KBASE_IOCTL_TYPE, 22, union kbase_ioctl_mem_import)
-
-/* -----------------------------------------------------------------------
- * Memory commit — change the number of pages backing a sparse allocation.
+ * Memory commit — change the physical backing of a growable region.
  * ----------------------------------------------------------------------- */
 struct kbase_ioctl_mem_commit {
    __u64 gpu_addr;
    __u64 pages;
 };
 #define KBASE_IOCTL_MEM_COMMIT \
-   _IOW(KBASE_IOCTL_TYPE, 23, struct kbase_ioctl_mem_commit)
+   _IOW(KBASE_IOCTL_TYPE, 20, struct kbase_ioctl_mem_commit)
 
 /* -----------------------------------------------------------------------
- * Memory alias — create an alias mapping of one or more BOs.
+ * Memory alias — create an alias of one or more existing regions.
  * ----------------------------------------------------------------------- */
-struct kbase_mem_alias_info {
+struct base_mem_aliasing_info {
    __u64 handle;
    __u64 offset;
    __u64 length;
@@ -263,12 +290,46 @@ union kbase_ioctl_mem_alias {
    } out;
 };
 #define KBASE_IOCTL_MEM_ALIAS \
-   _IOWR(KBASE_IOCTL_TYPE, 24, union kbase_ioctl_mem_alias)
+   _IOWR(KBASE_IOCTL_TYPE, 21, union kbase_ioctl_mem_alias)
 
 /* -----------------------------------------------------------------------
- * CPU–GPU timestamp correlation.
+ * Memory import — map external memory (dma-buf, user pointer) on the GPU.
  * ----------------------------------------------------------------------- */
-struct kbase_ioctl_get_cpu_gpu_timeinfo {
+union kbase_ioctl_mem_import {
+   struct {
+      __u64 flags;
+      __u64 phandle;
+      __u32 type;
+      __u32 padding;
+   } in;
+   struct {
+      __u64 flags;
+      __u64 gpu_va;
+      __u64 va_pages;
+   } out;
+};
+#define KBASE_IOCTL_MEM_IMPORT \
+   _IOWR(KBASE_IOCTL_TYPE, 22, union kbase_ioctl_mem_import)
+
+/* base_mem_import_type */
+#define BASE_MEM_IMPORT_TYPE_INVALID     0
+#define BASE_MEM_IMPORT_TYPE_UMM         2 /* dma-buf */
+#define BASE_MEM_IMPORT_TYPE_USER_BUFFER 3
+
+/* -----------------------------------------------------------------------
+ * Initialise the EXEC_VA zone.  Must be called (once) before any
+ * allocation with BASE_MEM_PROT_GPU_EX on 64-bit clients.
+ * ----------------------------------------------------------------------- */
+struct kbase_ioctl_mem_exec_init {
+   __u64 va_pages;
+};
+#define KBASE_IOCTL_MEM_EXEC_INIT \
+   _IOW(KBASE_IOCTL_TYPE, 38, struct kbase_ioctl_mem_exec_init)
+
+/* -----------------------------------------------------------------------
+ * CPU–GPU time correlation.
+ * ----------------------------------------------------------------------- */
+union kbase_ioctl_get_cpu_gpu_timeinfo {
    struct {
       __u32 request_flags;
       __u32 paddings[7];
@@ -282,9 +343,8 @@ struct kbase_ioctl_get_cpu_gpu_timeinfo {
    } out;
 };
 #define KBASE_IOCTL_GET_CPU_GPU_TIMEINFO \
-   _IOWR(KBASE_IOCTL_TYPE, 14, struct kbase_ioctl_get_cpu_gpu_timeinfo)
+   _IOWR(KBASE_IOCTL_TYPE, 50, union kbase_ioctl_get_cpu_gpu_timeinfo)
 
-/* Flags for get_cpu_gpu_timeinfo request */
-#define BASE_TIMEINFO_CYCLE_COUNTER_FLAG   (1U << 0)
-#define BASE_TIMEINFO_TIMESTAMP_FLAG       (1U << 1)
-#define BASE_TIMEINFO_MONOTONIC_FLAG       (1U << 2)
+#define BASE_TIMEINFO_MONOTONIC_FLAG     (1u << 0)
+#define BASE_TIMEINFO_TIMESTAMP_FLAG     (1u << 1)
+#define BASE_TIMEINFO_CYCLE_COUNTER_FLAG (1u << 2)
