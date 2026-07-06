@@ -327,6 +327,46 @@ struct kbase_ioctl_mem_exec_init {
    _IOW(KBASE_IOCTL_TYPE, 38, struct kbase_ioctl_mem_exec_init)
 
 /* -----------------------------------------------------------------------
+ * CSF global interface query (CSF flavour only).
+ * First call with max_group_num = max_total_stream_num = 0 to learn the
+ * counts (returned in out), then call again with buffers.
+ * ----------------------------------------------------------------------- */
+
+/* Per-CS capabilities.  features bits: [7:0] work register count,
+ * [15:8] scoreboard slot count. */
+struct basep_cs_stream_control {
+   __u32 features;
+   __u32 padding;
+};
+
+/* Per-CSG capabilities. */
+struct basep_cs_group_control {
+   __u32 features;
+   __u32 stream_num;
+   __u32 suspend_size;
+   __u32 padding;
+};
+
+union kbase_ioctl_cs_get_glb_iface {
+   struct {
+      __u32 max_group_num;
+      __u32 max_total_stream_num;
+      __u64 groups_ptr;
+      __u64 streams_ptr;
+   } in;
+   struct {
+      __u32 glb_version;
+      __u32 features;
+      __u32 group_num;
+      __u32 prfcnt_size;
+      __u32 total_stream_num;
+      __u32 instr_features;
+   } out;
+};
+#define KBASE_IOCTL_CS_GET_GLB_IFACE \
+   _IOWR(KBASE_IOCTL_TYPE, 51, union kbase_ioctl_cs_get_glb_iface)
+
+/* -----------------------------------------------------------------------
  * CPU–GPU time correlation.
  * ----------------------------------------------------------------------- */
 union kbase_ioctl_get_cpu_gpu_timeinfo {

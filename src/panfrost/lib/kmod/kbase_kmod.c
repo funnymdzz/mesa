@@ -46,6 +46,11 @@
 #include "util/log.h"
 
 #include "drm-uapi/mali_kbase_ioctl.h"
+/* Only used as the interchange format for CSF interface information; no
+ * panthor functionality is required. */
+#include "drm-uapi/panthor_drm.h"
+
+#include "kbase_kmod.h"
 #include "pan_kmod_backend.h"
 #include "pan_props.h"
 
@@ -61,6 +66,11 @@ struct kbase_kmod_dev {
 
    /* True for the CSF flavour of kbase (arch >= 10), false for JM. */
    bool is_csf;
+
+   /* CSF interface information (CSF only), queried from
+    * KBASE_IOCTL_CS_GET_GLB_IFACE and stored in the panthor uAPI layout
+    * so CSF-generic code can consume either backend. */
+   struct drm_panthor_csif_info csif_info;
 
    /* Tracking page mapped at BASE_MEM_MAP_TRACKING_HANDLE.  Required by
     * the kernel before any memory operation; unmapped at destroy time. */
@@ -315,6 +325,86 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
  * Device creation / destruction
  * ---------------------------------------------------------------------- */
 
+/* Query the CSF global interface and derive the information CSF-generic
+ * code needs, in the panthor uAPI layout.  Returns 0 on success. */
+static int
+kbase_query_csif_info(int fd, struct drm_panthor_csif_info *csif)
+{
+   /* First call with zero sizes to learn the group/stream counts. */
+   union kbase_ioctl_cs_get_glb_iface req = { 0 };
+   if (ioctl(fd, KBASE_IOCTL_CS_GET_GLB_IFACE, &req) < 0) {
+      mesa_loge("kbase: KBASE_IOCTL_CS_GET_GLB_IFACE (probe) failed: %s",
+                strerror(errno));
+      return -1;
+   }
+
+   uint32_t group_num = req.out.group_num;
+   uint32_t total_stream_num = req.out.total_stream_num;
+
+   if (!group_num || !total_stream_num) {
+      mesa_loge("kbase: GLB interface reports no queue groups/streams");
+      return -1;
+   }
+
+   struct basep_cs_group_control *groups =
+      calloc(group_num, sizeof(*groups));
+   struct basep_cs_stream_control *streams =
+      calloc(total_stream_num, sizeof(*streams));
+   if (!groups || !streams) {
+      free(groups);
+      free(streams);
+      return -1;
+   }
+
+   req.in.max_group_num = group_num;
+   req.in.max_total_stream_num = total_stream_num;
+   req.in.groups_ptr = (uintptr_t)groups;
+   req.in.streams_ptr = (uintptr_t)streams;
+
+   int ret = ioctl(fd, KBASE_IOCTL_CS_GET_GLB_IFACE, &req);
+   if (ret < 0) {
+      mesa_loge("kbase: KBASE_IOCTL_CS_GET_GLB_IFACE (fill) failed: %s",
+                strerror(errno));
+      free(groups);
+      free(streams);
+      return -1;
+   }
+
+   /* Stream features: [7:0] work register count, [15:8] scoreboard slot
+    * count.  Fall back to the values every shipping CSF part uses (and
+    * that the panthor kernel driver hardcodes) if a field reads zero. */
+   uint32_t stream_features = streams[0].features;
+   uint32_t cs_reg_count = stream_features & 0xff;
+   uint32_t scoreboard_slot_count = (stream_features >> 8) & 0xff;
+
+   *csif = (struct drm_panthor_csif_info){
+      .csg_slot_count = group_num,
+      .cs_slot_count = groups[0].stream_num,
+      .cs_reg_count = cs_reg_count ? cs_reg_count : 96,
+      .scoreboard_slot_count =
+         scoreboard_slot_count ? scoreboard_slot_count : 8,
+      /* Number of CS registers the FW may clobber; matches panthor's
+       * CSF_UNPRESERVED_REG_COUNT. */
+      .unpreserved_cs_reg_count = 4,
+   };
+
+   free(groups);
+   free(streams);
+   return 0;
+}
+
+const struct drm_panthor_csif_info *
+kbase_kmod_get_csif_props(const struct pan_kmod_dev *dev)
+{
+   assert(dev->ops == &kbase_kmod_ops);
+
+   struct kbase_kmod_dev *kbase_dev =
+      container_of(dev, struct kbase_kmod_dev, base);
+
+   assert(kbase_dev->is_csf);
+   return &kbase_dev->csif_info;
+}
+
 static struct pan_kmod_dev *
 kbase_kmod_dev_create(int fd, uint32_t flags,
                       UNUSED const struct pan_kmod_driver *drv_info,
@@ -408,6 +498,16 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    kbase_dev->is_csf = is_csf;
    kbase_dev->tracking_page = tracking_page;
    kbase_dev->next_handle = 1;
+
+   if (is_csf && kbase_query_csif_info(fd, &kbase_dev->csif_info)) {
+      mesa_loge("kbase: failed to query the CSF global interface");
+      free(props_buf);
+      munmap(tracking_page, 4096);
+      kbase_dev->base.flags &= ~PAN_KMOD_DEV_FLAG_OWNS_FD;
+      pan_kmod_dev_cleanup(&kbase_dev->base);
+      pan_kmod_free(allocator, kbase_dev);
+      return NULL;
+   }
 
    kbase_dev_query_props(kbase_dev, props_buf, props_size);
    free(props_buf);

@@ -39,6 +39,9 @@
 #endif
 
 #include "kmod/pan_kmod.h"
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#endif
 #include "util/os_file.h"
 #include "util/u_printf.h"
 #include "pan_props.h"
@@ -300,12 +303,72 @@ panvk_device_get_timestamp(struct vk_device *vk_dev, uint64_t *timestamp)
    return VK_SUCCESS;
 }
 
+#ifdef HAVE_PAN_KMOD_KBASE
+/* Command submission over kbase (CSF queue groups, ring buffers, real
+ * synchronization) is not implemented yet.  So that device creation — and
+ * with it tools like vulkaninfo — works, queues are created as stubs that
+ * fail at submit time with a clear message. */
+static bool
+panvk_kbase_stub_queues(const struct panvk_device *dev)
+{
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+
+   return phys_dev->kbase_node_path[0] != '\0';
+}
+
+static VkResult
+panvk_kbase_stub_queue_submit(struct vk_queue *queue,
+                              struct vk_queue_submit *submit)
+{
+   return vk_queue_set_lost(
+      queue, "kbase: command submission is not implemented yet");
+}
+
+static VkResult
+panvk_kbase_stub_queue_create(struct panvk_device *dev,
+                              const VkDeviceQueueCreateInfo *create_info,
+                              uint32_t queue_idx,
+                              struct vk_queue **out_queue)
+{
+   struct vk_queue *queue = vk_zalloc(&dev->vk.alloc, sizeof(*queue), 8,
+                                      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!queue)
+      return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   VkResult result = vk_queue_init(queue, &dev->vk, create_info, queue_idx);
+   if (result != VK_SUCCESS) {
+      vk_free(&dev->vk.alloc, queue);
+      return result;
+   }
+
+   queue->driver_submit = panvk_kbase_stub_queue_submit;
+   *out_queue = queue;
+   return VK_SUCCESS;
+}
+
+static void
+panvk_kbase_stub_queue_destroy(struct vk_queue *queue)
+{
+   struct vk_device *vk_dev = queue->base.device;
+
+   vk_queue_finish(queue);
+   vk_free(&vk_dev->alloc, queue);
+}
+#endif /* HAVE_PAN_KMOD_KBASE */
+
 static VkResult
 panvk_queue_create(struct panvk_device *dev,
                    const VkDeviceQueueCreateInfo *create_info,
                    uint32_t queue_idx,
                    struct vk_queue **out_queue)
 {
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (panvk_kbase_stub_queues(dev))
+      return panvk_kbase_stub_queue_create(dev, create_info, queue_idx,
+                                           out_queue);
+#endif
+
    switch (create_info->queueFamilyIndex) {
    case PANVK_QUEUE_FAMILY_GPU:
       return panvk_per_arch(create_gpu_queue)(
@@ -321,6 +384,15 @@ panvk_queue_create(struct panvk_device *dev,
 static void
 panvk_queue_destroy(struct vk_queue *queue)
 {
+#ifdef HAVE_PAN_KMOD_KBASE
+   struct panvk_device *dev = to_panvk_device(queue->base.device);
+
+   if (panvk_kbase_stub_queues(dev)) {
+      panvk_kbase_stub_queue_destroy(queue);
+      return;
+   }
+#endif
+
    switch (queue->queue_family_index) {
    case PANVK_QUEUE_FAMILY_GPU:
       panvk_per_arch(destroy_gpu_queue)(queue);
@@ -430,18 +502,6 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       goto err_finish_dev;
    }
 
-#if PAN_ARCH >= 10 && defined(HAVE_PAN_KMOD_KBASE)
-   if (physical_device->kbase_node_path[0]) {
-      /* CSF-on-kbase device support (GLB interface query, queue groups,
-       * command submission) is not implemented yet; fail cleanly before
-       * the code below starts reading panthor-specific data from a kbase
-       * device. */
-      result = panvk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
-                            "kbase: vkCreateDevice is not supported yet, "
-                            "only physical-device enumeration");
-      goto err_destroy_kdev;
-   }
-#endif
 
    if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) || PANVK_DEBUG(DUMP))
       device->debug.decode_ctx = pandecode_create_context(false);
@@ -453,6 +513,14 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    uint64_t user_va_end = physical_device->memory.max_supported_va;
    uint32_t vm_flags = PAN_ARCH < 10 ? PAN_KMOD_VM_FLAG_AUTO_VA : 0;
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* kbase assigns all GPU VAs itself (SAME_VA memory model); mapping at a
+    * caller-chosen address is not possible, so use AUTO_VA regardless of
+    * the architecture. */
+   if (physical_device->kbase_node_path[0])
+      vm_flags = PAN_KMOD_VM_FLAG_AUTO_VA;
+#endif
+
    device->kmod.vm =
       pan_kmod_vm_create(device->kmod.dev, vm_flags,
                          user_va_start, user_va_end - user_va_start);
@@ -463,8 +531,14 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    }
 
 #if PAN_ARCH >= 10
-   const struct drm_panthor_csif_info *csif_info =
-      panthor_kmod_get_csif_props(device->kmod.dev);
+   const struct drm_panthor_csif_info *csif_info;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (physical_device->kbase_node_path[0])
+      csif_info = kbase_kmod_get_csif_props(device->kmod.dev);
+   else
+#endif
+      csif_info = panthor_kmod_get_csif_props(device->kmod.dev);
 
    assert(csif_info->scoreboard_slot_count <= 16);
    device->csf.sb.count = csif_info->scoreboard_slot_count;
