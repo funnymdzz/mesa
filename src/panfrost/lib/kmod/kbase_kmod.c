@@ -370,19 +370,30 @@ kbase_query_csif_info(int fd, struct drm_panthor_csif_info *csif)
       return -1;
    }
 
-   /* Stream features: [7:0] work register count, [15:8] scoreboard slot
-    * count.  Fall back to the values every shipping CSF part uses (and
-    * that the panthor kernel driver hardcodes) if a field reads zero. */
+   /* Stream features nominally encode the work register count in [7:0]
+    * and the scoreboard slot count in [15:8], but the encoding is not
+    * reliable across kbase/firmware versions (a Pixel 7 kbase 1.38
+    * reports a work register value that underflows the register file the
+    * CS compiler was designed for).  Mirror the panthor kernel driver
+    * instead, which hardcodes 96 CS registers with 4 unpreserved ones on
+    * all shipping CSF parts, and only trust the scoreboard count when it
+    * is in the plausible [PANVK-supported] 1..16 range. */
    uint32_t stream_features = streams[0].features;
-   uint32_t cs_reg_count = stream_features & 0xff;
    uint32_t scoreboard_slot_count = (stream_features >> 8) & 0xff;
+
+   mesa_logd("kbase: GLB iface: version 0x%x, features 0x%x, %u groups, "
+             "%u streams (stream 0: features 0x%x, group 0: %u streams, "
+             "suspend size %u)",
+             req.out.glb_version, req.out.features, group_num,
+             total_stream_num, stream_features, groups[0].stream_num,
+             groups[0].suspend_size);
 
    *csif = (struct drm_panthor_csif_info){
       .csg_slot_count = group_num,
       .cs_slot_count = groups[0].stream_num,
-      .cs_reg_count = cs_reg_count ? cs_reg_count : 96,
+      .cs_reg_count = 96,
       .scoreboard_slot_count =
-         scoreboard_slot_count ? scoreboard_slot_count : 8,
+         (scoreboard_slot_count - 1) < 16 ? scoreboard_slot_count : 8,
       /* Number of CS registers the FW may clobber; matches panthor's
        * CSF_UNPRESERVED_REG_COUNT. */
       .unpreserved_cs_reg_count = 4,
