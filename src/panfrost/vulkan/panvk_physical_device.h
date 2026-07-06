@@ -49,6 +49,12 @@ struct panvk_physical_device {
       dev_t render_rdev;
    } drm;
 
+   /* Device node path for kbase (non-DRM) devices, e.g. "/dev/mali0";
+    * empty for DRM devices.  Logical devices must open() a fresh fd from
+    * this path: dup()ing the physical device fd would share the kbase
+    * context, whose version handshake can only be performed once. */
+   char kbase_node_path[32];
+
    struct {
       const struct pan_blendable_format *blendable;
       const struct pan_format *all;

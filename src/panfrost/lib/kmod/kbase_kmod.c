@@ -415,6 +415,9 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    if (!kbase_dev->base.props.gpu_id) {
       mesa_loge("kbase: failed to determine GPU ID from properties");
       munmap(tracking_page, 4096);
+      /* On failure the caller keeps ownership of the fd (it closes it on
+       * NULL return), so don't let pan_kmod_dev_cleanup() close it too. */
+      kbase_dev->base.flags &= ~PAN_KMOD_DEV_FLAG_OWNS_FD;
       pan_kmod_dev_cleanup(&kbase_dev->base);
       pan_kmod_free(allocator, kbase_dev);
       return NULL;

@@ -149,6 +149,9 @@ create_kmod_dev_kbase(struct panvk_physical_device *device,
                           "failed to create kbase device at %s", path);
    }
 
+   snprintf(device->kbase_node_path, sizeof(device->kbase_node_path), "%s",
+            path);
+
    return VK_SUCCESS;
 }
 #endif /* HAVE_PAN_KMOD_KBASE */

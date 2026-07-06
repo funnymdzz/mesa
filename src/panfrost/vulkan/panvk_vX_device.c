@@ -34,6 +34,10 @@
 #include "genxml/decode.h"
 #include "genxml/gen_macros.h"
 
+#ifdef HAVE_PAN_KMOD_KBASE
+#include <fcntl.h>
+#endif
+
 #include "kmod/pan_kmod.h"
 #include "util/os_file.h"
 #include "util/u_printf.h"
@@ -395,15 +399,49 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       .free = panvk_kmod_free,
       .priv = &device->vk.alloc,
    };
-   device->kmod.dev = pan_kmod_dev_create(
-      os_dupfd_cloexec(physical_device->kmod.dev->fd),
-      physical_device->kmod.dev->flags, &device->kmod.allocator);
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (physical_device->kbase_node_path[0]) {
+      /* dup()ing a kbase fd would share the physical device's kbase
+       * context, whose version handshake can only be done once; open a
+       * fresh context instead.  A separate context also means a separate
+       * GPU address space, which matches the per-logical-device VM
+       * semantics of the DRM backends. */
+      int kbase_fd =
+         open(physical_device->kbase_node_path, O_RDWR | O_CLOEXEC);
+      if (kbase_fd >= 0) {
+         device->kmod.dev = pan_kmod_dev_create_with_driver(
+            kbase_fd, physical_device->kmod.dev->flags, "kbase", NULL,
+            &device->kmod.allocator);
+         if (!device->kmod.dev)
+            close(kbase_fd);
+      }
+   } else
+#endif
+   {
+      device->kmod.dev = pan_kmod_dev_create(
+         os_dupfd_cloexec(physical_device->kmod.dev->fd),
+         physical_device->kmod.dev->flags, &device->kmod.allocator);
+   }
 
    if (!device->kmod.dev) {
       result = panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
                             "cannot create device");
       goto err_finish_dev;
    }
+
+#if PAN_ARCH >= 10 && defined(HAVE_PAN_KMOD_KBASE)
+   if (physical_device->kbase_node_path[0]) {
+      /* CSF-on-kbase device support (GLB interface query, queue groups,
+       * command submission) is not implemented yet; fail cleanly before
+       * the code below starts reading panthor-specific data from a kbase
+       * device. */
+      result = panvk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                            "kbase: vkCreateDevice is not supported yet, "
+                            "only physical-device enumeration");
+      goto err_destroy_kdev;
+   }
+#endif
 
    if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) || PANVK_DEBUG(DUMP))
       device->debug.decode_ctx = pandecode_create_context(false);
