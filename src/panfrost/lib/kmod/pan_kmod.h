@@ -447,6 +447,25 @@ struct pan_kmod_ops {
    /* Get the file offset to use to mmap() a buffer object. */
    off_t (*bo_get_mmap_offset)(struct pan_kmod_bo *bo);
 
+   /* Map a buffer object for CPU access.
+    * This method is optional. When missing, the BO is mapped by calling
+    * mmap() on the device fd with the offset returned by
+    * bo_get_mmap_offset().
+    * Backends where the CPU mapping is established at allocation time
+    * (kbase SAME_VA) implement this to return the existing mapping.
+    * Returns MAP_FAILED on error.
+    */
+   void *(*bo_mmap)(struct pan_kmod_bo *bo, int prot, int flags,
+                    void *host_addr);
+
+   /* Unmap a CPU mapping previously returned by pan_kmod_bo_mmap().
+    * This method is optional. When missing, munmap() is called directly.
+    * Backends where the CPU mapping is owned by the BO (kbase SAME_VA)
+    * implement this as a no-op and tear the mapping down at bo_free time.
+    * Returns 0 on success, -1 otherwise.
+    */
+   int (*bo_munmap)(struct pan_kmod_bo *bo, void *host_addr, size_t size);
+
    /* Flush the pending BO map syncs. */
    int (*flush_bo_map_syncs)(struct pan_kmod_dev *dev);
 
@@ -700,6 +719,14 @@ pan_kmod_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr)
    if (bo->flags & PAN_KMOD_BO_FLAG_NO_MMAP)
       return MAP_FAILED;
 
+   if (bo->dev->ops->bo_mmap) {
+      host_addr = bo->dev->ops->bo_mmap(bo, prot, flags, host_addr);
+      if (host_addr == MAP_FAILED)
+         mesa_loge("bo_mmap(..., size=%" PRIu64 ", prot=%d, flags=0x%x) failed: %s",
+                   bo->size, prot, flags, strerror(errno));
+      return host_addr;
+   }
+
    mmap_offset = bo->dev->ops->bo_get_mmap_offset(bo);
    if (mmap_offset < 0)
       return MAP_FAILED;
@@ -711,6 +738,20 @@ pan_kmod_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr)
                 bo->size, prot, flags, strerror(errno));
 
    return host_addr;
+}
+
+/* Unmap a CPU mapping obtained from pan_kmod_bo_mmap(). Callers must use
+ * this instead of munmap()/os_munmap(): on some backends (kbase SAME_VA)
+ * unmapping would destroy the GPU mapping too, so the backend keeps the
+ * mapping alive until the BO is freed.
+ */
+static inline int
+pan_kmod_bo_munmap(struct pan_kmod_bo *bo, void *host_addr, size_t size)
+{
+   if (bo->dev->ops->bo_munmap)
+      return bo->dev->ops->bo_munmap(bo, host_addr, size);
+
+   return os_munmap(host_addr, size);
 }
 
 static inline bool
