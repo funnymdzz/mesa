@@ -577,29 +577,51 @@ panvk_physical_device_finish(struct panvk_physical_device *device)
    vk_physical_device_finish(&device->vk);
 }
 
+/* Resolve the pan_model for a probed device.  GPUs missing from the model
+ * table get conservative per-arch defaults instead of being rejected;
+ * *unknown_gpu is set so callers can reflect that in the device name. */
+static VkResult
+get_gpu_model(struct panvk_physical_device *device,
+              const struct panvk_instance *instance, bool *unknown_gpu)
+{
+   const struct pan_kmod_dev_props *props = &device->kmod.dev->props;
+
+   *unknown_gpu = false;
+   device->model = pan_get_model(props->gpu_id, props->gpu_variant);
+   if (device->model)
+      return VK_SUCCESS;
+
+   device->model = pan_get_fallback_model(props->gpu_id);
+   if (!device->model) {
+      return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                          "Unknown gpu_id (%#" PRIx64 ") or variant (%#x)",
+                          props->gpu_id, props->gpu_variant);
+   }
+
+   *unknown_gpu = true;
+   mesa_logw("panvk: unknown gpu_id (%#" PRIx64 ") or variant (%#x); "
+             "continuing with conservative \"%s\" defaults — expect issues",
+             props->gpu_id, props->gpu_variant, device->model->name);
+   return VK_SUCCESS;
+}
+
 VkResult
 panvk_physical_device_init(struct panvk_physical_device *device,
                            struct panvk_instance *instance,
                            drmDevicePtr drm_device)
 {
    VkResult result;
+   bool unknown_gpu;
 
    result = create_kmod_dev(device, instance, drm_device);
    if (result != VK_SUCCESS)
       return result;
 
-   device->model = pan_get_model(device->kmod.dev->props.gpu_id,
-                                 device->kmod.dev->props.gpu_variant);
-
    unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
 
-   if (!device->model) {
-      result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
-                            "Unknown gpu_id (%#" PRIx64 ") or variant (%#x)",
-                            device->kmod.dev->props.gpu_id,
-                            device->kmod.dev->props.gpu_variant);
+   result = get_gpu_model(device, instance, &unknown_gpu);
+   if (result != VK_SUCCESS)
       goto fail;
-   }
 
    switch (arch) {
    case 6:
@@ -637,7 +659,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
       pan_query_core_count(&device->kmod.dev->props, &core_id_range);
 
    memset(device->name, 0, sizeof(device->name));
-   sprintf(device->name, "%s MC%u", device->model->name, core_count);
+   if (unknown_gpu)
+      snprintf(device->name, sizeof(device->name),
+               "Mali unknown 0x%" PRIx64 " MC%u",
+               device->kmod.dev->props.gpu_id, core_count);
+   else
+      sprintf(device->name, "%s MC%u", device->model->name, core_count);
 
    result = get_core_masks(device, instance);
    if (result != VK_SUCCESS)
@@ -720,18 +747,12 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
    if (result != VK_SUCCESS)
       return result;
 
-   device->model = pan_get_model(device->kmod.dev->props.gpu_id,
-                                 device->kmod.dev->props.gpu_variant);
-
    unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
 
-   if (!device->model) {
-      result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
-                            "Unknown gpu_id (%#" PRIx64 ") or variant (%#x)",
-                            device->kmod.dev->props.gpu_id,
-                            device->kmod.dev->props.gpu_variant);
+   bool unknown_gpu;
+   result = get_gpu_model(device, instance, &unknown_gpu);
+   if (result != VK_SUCCESS)
       goto fail_kbase;
-   }
 
    switch (arch) {
    case 6:
@@ -768,7 +789,12 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
       pan_query_core_count(&device->kmod.dev->props, &core_id_range);
 
    memset(device->name, 0, sizeof(device->name));
-   sprintf(device->name, "%s MC%u", device->model->name, core_count);
+   if (unknown_gpu)
+      snprintf(device->name, sizeof(device->name),
+               "Mali unknown 0x%" PRIx64 " MC%u",
+               device->kmod.dev->props.gpu_id, core_count);
+   else
+      sprintf(device->name, "%s MC%u", device->model->name, core_count);
 
    result = get_core_masks(device, instance);
    if (result != VK_SUCCESS)
