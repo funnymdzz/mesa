@@ -19,7 +19,27 @@
 
 #ifdef HAVE_PAN_KMOD_KBASE
 #include <fcntl.h>
+#include <stdlib.h>
 #include "kmod/pan_kmod.h"
+
+/* Command submission on kbase (CSF queue groups / JM job atoms) is not
+ * implemented yet: a GL context would fail or crash at creation time since
+ * the submission paths hardcode the panthor/panfrost DRM uAPIs.  Until that
+ * lands, refuse to expose a Gallium device on kbase so GL loaders cleanly
+ * fall back — Vulkan device enumeration through panvk is unaffected. */
+static bool
+panfrost_gl_on_kbase_allowed(void)
+{
+   const char *env = getenv("PAN_EXPERIMENTAL_KBASE_GL");
+   if (env && env[0] == '1' && env[1] == '\0')
+      return true;
+
+   mesa_logw("panfrost: found a kbase GPU, but OpenGL on kbase requires "
+             "command submission support that is not implemented yet; not "
+             "exposing a Gallium device (Vulkan enumeration via panvk still "
+             "works). Set PAN_EXPERIMENTAL_KBASE_GL=1 to bypass.");
+   return false;
+}
 #endif
 
 /* DRM_PANFROST_PARAM_TEXTURE_FEATURES0 will return a bitmask of supported
@@ -46,6 +66,13 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    if (!dev->kmod.dev) {
       dev->kmod.dev = pan_kmod_dev_create_with_driver(
          fd, PAN_KMOD_DEV_FLAG_OWNS_FD, "kbase", NULL, NULL);
+
+      if (dev->kmod.dev && !panfrost_gl_on_kbase_allowed()) {
+         /* Destroying the device closes the fd (OWNS_FD). */
+         pan_kmod_dev_destroy(dev->kmod.dev);
+         dev->kmod.dev = NULL;
+         return -1;
+      }
    }
 #endif
 
@@ -192,6 +219,13 @@ panfrost_open_device_kbase(void *memctx, const char *path,
    if (!dev->kmod.dev) {
       mesa_loge("panfrost: failed to create kbase kmod device for %s", path);
       close(fd);
+      return -1;
+   }
+
+   if (!panfrost_gl_on_kbase_allowed()) {
+      /* Destroying the device closes the fd (OWNS_FD). */
+      pan_kmod_dev_destroy(dev->kmod.dev);
+      dev->kmod.dev = NULL;
       return -1;
    }
 
