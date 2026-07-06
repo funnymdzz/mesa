@@ -239,7 +239,7 @@ panvk_per_arch(utrace_clone_init_builder)(struct cs_builder *b,
                                           const struct cs_buffer *cs_root)
 {
    const struct drm_panthor_csif_info *csif_info =
-      panthor_kmod_get_csif_props(dev->kmod.dev);
+      panvk_get_csif_props(dev);
    const struct cs_builder_conf builder_conf = {
       .nr_registers = csif_info->cs_reg_count,
       .nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4),

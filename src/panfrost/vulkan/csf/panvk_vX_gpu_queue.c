@@ -392,7 +392,7 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
 
    struct cs_builder b;
    const struct drm_panthor_csif_info *csif_info =
-      panthor_kmod_get_csif_props(dev->kmod.dev);
+      panvk_get_csif_props(dev);
 
    struct cs_buffer root_cs = {
       .cpu = panvk_priv_mem_host_addr(subq->req_resource.buf),

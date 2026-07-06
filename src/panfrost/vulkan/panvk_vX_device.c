@@ -39,9 +39,6 @@
 #endif
 
 #include "kmod/pan_kmod.h"
-#ifdef HAVE_PAN_KMOD_KBASE
-#include "kmod/kbase_kmod.h"
-#endif
 #include "util/os_file.h"
 #include "util/u_printf.h"
 #include "pan_props.h"
@@ -531,14 +528,8 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    }
 
 #if PAN_ARCH >= 10
-   const struct drm_panthor_csif_info *csif_info;
-
-#ifdef HAVE_PAN_KMOD_KBASE
-   if (physical_device->kbase_node_path[0])
-      csif_info = kbase_kmod_get_csif_props(device->kmod.dev);
-   else
-#endif
-      csif_info = panthor_kmod_get_csif_props(device->kmod.dev);
+   const struct drm_panthor_csif_info *csif_info =
+      panvk_get_csif_props(device);
 
    assert(csif_info->scoreboard_slot_count <= 16);
    device->csf.sb.count = csif_info->scoreboard_slot_count;
