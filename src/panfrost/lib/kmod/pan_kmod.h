@@ -39,6 +39,11 @@
 #include "kmod/panthor_kmod.h"
 #include "pan_trace.h"
 
+/* Maximum number of /dev/mali* device nodes to probe. */
+#if defined(HAVE_PAN_KMOD_KBASE)
+#define PAN_KBASE_MAX_NODES 8
+#endif
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
@@ -562,6 +567,12 @@ struct pan_kmod_dev {
 struct pan_kmod_dev *
 pan_kmod_dev_create(int fd, uint32_t flags,
                     const struct pan_kmod_allocator *allocator);
+
+struct pan_kmod_dev *
+pan_kmod_dev_create_with_driver(int fd, uint32_t flags,
+                                const char *driver_name,
+                                const struct pan_kmod_driver *driver,
+                                const struct pan_kmod_allocator *allocator);
 
 void pan_kmod_dev_destroy(struct pan_kmod_dev *dev);
 

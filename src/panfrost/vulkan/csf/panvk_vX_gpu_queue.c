@@ -318,8 +318,15 @@ init_utrace(struct panvk_gpu_queue *queue)
    VkResult result;
 
    const struct vk_sync_type *sync_type = phys_dev->sync_types[0];
-   assert(sync_type && vk_sync_type_is_drm_syncobj(sync_type) &&
-          (sync_type->features & VK_SYNC_FEATURE_TIMELINE));
+
+   /* A DRM-backed timeline sync is required for CSF queue operation.
+    * Non-DRM backends (e.g. kbase) are not yet supported here. */
+   if (!sync_type || !vk_sync_type_is_drm_syncobj(sync_type) ||
+       !(sync_type->features & VK_SYNC_FEATURE_TIMELINE)) {
+      return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                       "panvk CSF: timeline DRM syncobj required for queue "
+                       "creation; non-DRM backends are not yet supported");
+   }
 
    result = vk_sync_create(&dev->vk, sync_type, VK_SYNC_IS_TIMELINE, 0,
                            &queue->utrace.sync);
