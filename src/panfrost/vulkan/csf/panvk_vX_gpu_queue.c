@@ -26,6 +26,7 @@
 #ifdef HAVE_PAN_KMOD_KBASE
 #include <inttypes.h>
 #include <unistd.h>
+#include "drm-uapi/mali_kbase_ioctl.h"
 #include "kmod/kbase_kmod.h"
 #endif
 
@@ -116,7 +117,7 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    }
 
    struct cs_buffer ring_buf = {
-      .cpu = (uint8_t *)subq->kbase.ringbuf_cpu + offset,
+      .cpu = (uint64_t *)((uint8_t *)subq->kbase.ringbuf_cpu + offset),
       .gpu = subq->kbase.ringbuf_dev + offset,
       .capacity = KBASE_RING_JOB_MAX_SIZE / sizeof(uint64_t),
    };
