@@ -436,12 +436,11 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
          ringbuf->addr.dev = map_op.va.start;
       } else {
          /* Mapping one BO twice back-to-back at a chosen address is not
-          * possible on kbase; use a MEM_ALIAS region instead.  The
-          * alignment guarantees the mapping never crosses a 4G boundary,
-          * so the wraparound can be encoded with 32-bit operations. */
-         ringbuf->addr.dev =
-            kbase_kmod_alias_create(dev->kmod.dev, map_op.va.start,
-                                    ringbuf->size, 2, ringbuf->size * 2);
+          * possible on kbase; use a MEM_ALIAS region instead.  The helper
+          * guarantees the mapping never crosses a 4G boundary, so the
+          * wraparound can be encoded with 32-bit operations. */
+         ringbuf->addr.dev = kbase_kmod_alias_create(
+            dev->kmod.dev, map_op.va.start, ringbuf->size, 2);
          if (!ringbuf->addr.dev)
             return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                                 "Failed to GPU map ringbuf BO (alias)");

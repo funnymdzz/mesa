@@ -605,7 +605,7 @@ kbase_kmod_csf_tiler_heap_destroy(struct pan_kmod_dev *dev,
 
 uint64_t
 kbase_kmod_alias_create(struct pan_kmod_dev *dev, uint64_t bo_va,
-                        uint64_t size, uint32_t nents, uint64_t align)
+                        uint64_t size, uint32_t nents)
 {
    const uint64_t page_size = 4096;
    uint64_t total = size * nents;
@@ -613,7 +613,6 @@ kbase_kmod_alias_create(struct pan_kmod_dev *dev, uint64_t bo_va,
 
    assert(nents >= 1 && nents <= ARRAY_SIZE(ai));
    assert(!(size % page_size) && !(bo_va % page_size));
-   assert(util_is_power_of_two_nonzero64(align));
 
    for (uint32_t i = 0; i < nents; i++) {
       ai[i] = (struct base_mem_aliasing_info){
@@ -623,59 +622,58 @@ kbase_kmod_alias_create(struct pan_kmod_dev *dev, uint64_t bo_va,
       };
    }
 
-   /* Note: CPU_WR is not allowed on alias regions, and the source BO must
-    * be GPU-cached and share the same coherency domain. */
-   union kbase_ioctl_mem_alias req = {
-      .in = {
-         .flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
-                  BASE_MEM_PROT_CPU_RD,
-         .stride = size / page_size,
-         .nents = nents,
-         .aliasing_info = (uintptr_t)ai,
-      },
-   };
+   /* kbase's get_unmapped_area rejects MAP_FIXED and address hints
+    * outright ("err on fixed address"), so the kernel always picks the
+    * address.  Callers only need the mapping to not cross a 4G boundary
+    * (so ring wraparound can be done with 32-bit maths), which a
+    * kernel-picked address almost always satisfies — in the unlikely case
+    * it doesn't, destroy the mapping and try again with a fresh alias
+    * region. */
+   for (unsigned attempt = 0; attempt < 16; attempt++) {
+      /* Note: CPU_WR is not allowed on alias regions, and the source BO
+       * must be GPU-cached and share the same coherency domain. */
+      union kbase_ioctl_mem_alias req = {
+         .in = {
+            .flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                     BASE_MEM_PROT_CPU_RD,
+            .stride = size / page_size,
+            .nents = nents,
+            .aliasing_info = (uintptr_t)ai,
+         },
+      };
 
-   if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALIAS, &req)) {
-      mesa_loge("kbase: KBASE_IOCTL_MEM_ALIAS failed: %s", strerror(errno));
-      return 0;
+      if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALIAS, &req)) {
+         mesa_loge("kbase: KBASE_IOCTL_MEM_ALIAS failed: %s",
+                   strerror(errno));
+         return 0;
+      }
+
+      /* For 64-bit clients the alias is a SAME_VA region: out.gpu_va is a
+       * cookie and mmap()ing it establishes the mapping, with the
+       * resulting address being both the CPU and GPU VA. */
+      void *ptr =
+         mmap(NULL, total, PROT_READ, MAP_SHARED, dev->fd, req.out.gpu_va);
+      if (ptr == MAP_FAILED) {
+         mesa_loge("kbase: mmap of alias region failed: %s",
+                   strerror(errno));
+         struct kbase_ioctl_mem_free free_req = { .gpu_addr = req.out.gpu_va };
+         ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &free_req);
+         return 0;
+      }
+
+      uint64_t va = (uintptr_t)ptr;
+
+      if ((va >> 32) == ((va + total - 1) >> 32))
+         return va;
+
+      /* Crosses a 4G boundary: munmap destroys the SAME_VA alias region
+       * (free-on-close), try again. */
+      munmap(ptr, total);
    }
 
-   /* For 64-bit clients the alias is a SAME_VA region: out.gpu_va is a
-    * cookie and mmap()ing it establishes the mapping.  Reserve an aligned
-    * window first and map at a fixed address inside it so the caller's
-    * alignment requirement is met. */
-   if (align < page_size)
-      align = page_size;
-
-   void *reserve = mmap(NULL, total + align, PROT_NONE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-   if (reserve == MAP_FAILED) {
-      struct kbase_ioctl_mem_free free_req = { .gpu_addr = req.out.gpu_va };
-      ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &free_req);
-      return 0;
-   }
-
-   uintptr_t aligned = ALIGN_POT((uintptr_t)reserve, (uintptr_t)align);
-
-   void *ptr = mmap((void *)aligned, total, PROT_READ, MAP_SHARED | MAP_FIXED,
-                    dev->fd, req.out.gpu_va);
-   if (ptr == MAP_FAILED) {
-      mesa_loge("kbase: mmap of alias region failed: %s", strerror(errno));
-      munmap(reserve, total + align);
-      struct kbase_ioctl_mem_free free_req = { .gpu_addr = req.out.gpu_va };
-      ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &free_req);
-      return 0;
-   }
-
-   /* Trim the reservation around the fixed mapping. */
-   if (aligned > (uintptr_t)reserve)
-      munmap(reserve, aligned - (uintptr_t)reserve);
-
-   uintptr_t reserve_end = (uintptr_t)reserve + total + align;
-   if (reserve_end > aligned + total)
-      munmap((void *)(aligned + total), reserve_end - (aligned + total));
-
-   return (uint64_t)aligned;
+   mesa_loge("kbase: could not get an alias mapping that doesn't cross a "
+             "4G boundary");
+   return 0;
 }
 
 void
