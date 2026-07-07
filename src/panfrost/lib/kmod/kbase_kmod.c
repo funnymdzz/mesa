@@ -664,10 +664,29 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
       goto err_unmap_tracking;
    }
 
+   /* Initialise the JIT allocator.  This must happen before any allocation
+    * is made: besides setting up JIT, on 64-bit clients this is what carves
+    * the CUSTOM_VA zone out of the top of the SAME_VA zone
+    * (kbase_region_tracker_init_jit_64) — and kernel-internal allocations
+    * such as tiler heap contexts/chunks come from that zone, so without it
+    * KBASE_IOCTL_CS_TILER_HEAP_INIT fails with ENOMEM.  Parameters match
+    * panfork's.  Failure is non-fatal for enumeration but breaks tiler
+    * heaps, so warn. */
+   struct kbase_ioctl_mem_jit_init jit_init = {
+      .va_pages = 1ull << 25,
+      .max_allocations = 255,
+      .phys_pages = 1ull << 25,
+   };
+   if (ioctl(fd, KBASE_IOCTL_MEM_JIT_INIT, &jit_init)) {
+      mesa_logw("kbase: KBASE_IOCTL_MEM_JIT_INIT failed: %s "
+                "(tiler heap creation will not work)", strerror(errno));
+   }
+
    /* Initialise the EXEC_VA zone so that GPU-executable allocations
     * (shader BOs) are possible.  4G of executable VA (0x100000 pages)
-    * matches what panfork uses.  Failure is not fatal for enumeration, but
-    * executable allocations will fail later, so warn. */
+    * matches what panfork uses.  On CSF uAPI >= 1.9 the zone is set up
+    * automatically and this is a no-op.  Failure is not fatal for
+    * enumeration, but executable allocations will fail later, so warn. */
    struct kbase_ioctl_mem_exec_init exec_init = { .va_pages = 0x100000 };
    if (ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec_init)) {
       mesa_logw("kbase: KBASE_IOCTL_MEM_EXEC_INIT failed: %s "
