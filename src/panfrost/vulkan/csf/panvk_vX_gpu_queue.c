@@ -121,8 +121,6 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
       .gpu = subq->kbase.ringbuf_dev + offset,
       .capacity = KBASE_RING_JOB_MAX_SIZE / sizeof(uint64_t),
    };
-   /* nr_kernel_registers is left at 0 so that we are allowed to use the
-    * FW-unpreserved registers everything else keeps clear of. */
    struct cs_builder_conf conf = {
       .nr_registers = csif_info->cs_reg_count,
       .ls_sb_slot = SB_ID(LS),
@@ -131,10 +129,27 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
 
    cs_builder_init(&b, &conf, ring_buf);
 
+   /* The ring sequence may only clobber the FW-unpreserved registers (the
+    * top 4), but cs_builder_init() reserves at least 3 registers for its
+    * own chunk linking — which our fixed-size ring entries never trigger —
+    * and cs_reg_tuple() refuses to hand those out.  Construct the indices
+    * directly instead. */
    uint32_t reg = csif_info->cs_reg_count - 4;
-   struct cs_index addr64 = cs_reg64(&b, reg);
-   struct cs_index val32 = cs_reg32(&b, reg + 2);
-   struct cs_index val64 = cs_reg64(&b, reg + 2);
+   struct cs_index addr64 = {
+      .type = CS_INDEX_REGISTER,
+      .size = 2,
+      .reg = reg,
+   };
+   struct cs_index val32 = {
+      .type = CS_INDEX_REGISTER,
+      .size = 1,
+      .reg = reg + 2,
+   };
+   struct cs_index val64 = {
+      .type = CS_INDEX_REGISTER,
+      .size = 2,
+      .reg = reg + 2,
+   };
 
    if (stream_size) {
       /* Make CPU-written command-stream/descriptor memory visible to the
