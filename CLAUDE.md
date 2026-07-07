@@ -86,15 +86,23 @@ kbase is fundamentally different from the DRM backends (see the header comment i
 3. **Fd-based fallback**: when DRM version detection fails on an fd handed to the panfrost
    Gallium driver, it retries with the kbase backend.
 
-### Synchronization (current state — placeholder)
+### Command submission on kbase (CSF, synchronous model)
 
-kbase has no DRM syncobjs, so `panvk_physical_device.c` defines `kbase_cpu_sync_type`, a
-host-side spin-wait binary sync wrapped in `vk_sync_timeline` emulation for CSF (arch ≥ 10).
-**Real GPU synchronization is not wired up yet**; command submission on kbase is not functional
-end-to-end. The CSF queue code (`csf/panvk_vX_gpu_queue.c`) returns
-`VK_ERROR_INITIALIZATION_FAILED` gracefully instead of asserting when the sync type isn't
-DRM-backed. Other known gaps are documented in comments in `kbase_kmod.c` (bo_wait,
-timestamp_frequency, user-mmap cache sync).
+panvk submits work on kbase through userspace-owned CS ring buffers
+(`csf/panvk_vX_gpu_queue.c`, kbase branches guarded by `HAVE_PAN_KMOD_KBASE` +
+`gpu_queue_uses_kbase()`): one queue group per Vulkan queue with one 64K ring per panvk
+subqueue, bound via `CS_QUEUE_REGISTER/BIND`, USER_IO pages mmapped from the bind cookie.
+Every submission emits the same ring sequence the panthor kernel uses (FLUSH_CACHE2 gated on
+LATEST_FLUSH → CALL → SYNC_ADD64 on a per-subqueue seqno cell, deferred on all scoreboard
+slots), clobbering only the 4 FW-unpreserved registers, then publishes CS_INSERT and kicks.
+All touched subqueues must be kicked before waiting on any (their streams cross-synchronize).
+CSF-generic panvk code must use `panvk_get_csif_props()` / `panvk_get_flush_id()`
+(`panvk_device.h`) — never the `panthor_kmod_*` variants directly.
+
+**Synchronization is synchronous**: submissions are CPU-waited by polling seqno cells,
+semaphore waits/signals resolve on the CPU (`kbase_cpu_sync_type` spin-wait syncs in
+`panvk_physical_device.c`). Async submission (kbase fences/KCPU queues), sparse binding
+(BIND queue family is a stub), dma-buf import/WSI, and `bo_wait` remain future work.
 
 ## Conventions
 
