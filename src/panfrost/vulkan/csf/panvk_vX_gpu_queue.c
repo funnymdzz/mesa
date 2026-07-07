@@ -341,6 +341,15 @@ finish_render_desc_ringbuf(struct panvk_gpu_queue *queue)
                                ringbuf->size);
    }
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev)) {
+      /* The BO's own mapping goes away with the BO; only the alias region
+       * (not created in tracing mode) needs explicit teardown. */
+      if (ringbuf->addr.dev && !tracing_enabled)
+         kbase_kmod_alias_destroy(dev->kmod.dev, ringbuf->addr.dev,
+                                  ringbuf->size, 2);
+   } else
+#endif
    if (ringbuf->addr.dev) {
       struct pan_kmod_vm_op op = {
          .type = PAN_KMOD_VM_OP_TYPE_UNMAP,
@@ -401,6 +410,46 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
                              "Failed to CPU map ringbuf BO");
    }
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev)) {
+      /* kbase assigns the BO VA itself; report it back through an AUTO_VA
+       * map op. */
+      struct pan_kmod_vm_op map_op = {
+         .type = PAN_KMOD_VM_OP_TYPE_MAP,
+         .va = {
+            .start = PAN_KMOD_VM_MAP_AUTO_VA,
+            .size = ringbuf->size,
+         },
+         .map = {
+            .bo = ringbuf->bo,
+            .bo_offset = 0,
+         },
+      };
+      ret = pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE,
+                             &map_op, 1);
+      if (ret)
+         return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Failed to GPU map ringbuf BO");
+
+      if (tracing_enabled) {
+         /* No wraparound mirror needed (and no guard page support). */
+         ringbuf->addr.dev = map_op.va.start;
+      } else {
+         /* Mapping one BO twice back-to-back at a chosen address is not
+          * possible on kbase; use a MEM_ALIAS region instead.  The
+          * alignment guarantees the mapping never crosses a 4G boundary,
+          * so the wraparound can be encoded with 32-bit operations. */
+         ringbuf->addr.dev =
+            kbase_kmod_alias_create(dev->kmod.dev, map_op.va.start,
+                                    ringbuf->size, 2, ringbuf->size * 2);
+         if (!ringbuf->addr.dev)
+            return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                                "Failed to GPU map ringbuf BO (alias)");
+      }
+      goto ringbuf_mapped;
+   }
+#endif
+
    /* We choose the alignment to guarantee that we won't ever cross a 4G
     * boundary when accessing the mapping. This way we can encode the wraparound
     * using 32-bit operations. */
@@ -448,6 +497,9 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
 
    ringbuf->addr.dev = dev_addr;
 
+#ifdef HAVE_PAN_KMOD_KBASE
+ringbuf_mapped:
+#endif
    if (dev->debug.decode_ctx) {
       pandecode_inject_mmap(dev->debug.decode_ctx, ringbuf->addr.dev,
                             ringbuf->addr.host, ringbuf->size, NULL);

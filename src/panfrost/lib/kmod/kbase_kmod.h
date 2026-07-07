@@ -60,6 +60,18 @@ int kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
 void kbase_kmod_csf_tiler_heap_destroy(struct pan_kmod_dev *dev,
                                        uint64_t heap_ctx_va);
 
+/* Map a (GPU-cached, SAME_VA) BO `nents` times back-to-back at a single
+ * `align`-aligned VA using KBASE_IOCTL_MEM_ALIAS — the kbase substitute
+ * for mapping one BO at several chosen addresses (used for wraparound
+ * ring buffers).  Returns the base VA of the repeated mapping
+ * (CPU == GPU), or 0 on failure.  Release with
+ * kbase_kmod_alias_destroy(). */
+uint64_t kbase_kmod_alias_create(struct pan_kmod_dev *dev, uint64_t bo_va,
+                                 uint64_t size, uint32_t nents,
+                                 uint64_t align);
+void kbase_kmod_alias_destroy(struct pan_kmod_dev *dev, uint64_t va,
+                              uint64_t size, uint32_t nents);
+
 #if defined(__cplusplus)
 } // extern "C"
 #endif

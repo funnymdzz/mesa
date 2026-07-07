@@ -43,6 +43,7 @@
 #include "util/macros.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
+#include "util/u_math.h"
 #include "util/log.h"
 
 #include "drm-uapi/mali_kbase_ioctl.h"
@@ -600,6 +601,89 @@ kbase_kmod_csf_tiler_heap_destroy(struct pan_kmod_dev *dev,
    if (ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_TERM, &req))
       mesa_loge("kbase: KBASE_IOCTL_CS_TILER_HEAP_TERM failed: %s",
                 strerror(errno));
+}
+
+uint64_t
+kbase_kmod_alias_create(struct pan_kmod_dev *dev, uint64_t bo_va,
+                        uint64_t size, uint32_t nents, uint64_t align)
+{
+   const uint64_t page_size = 4096;
+   uint64_t total = size * nents;
+   struct base_mem_aliasing_info ai[4];
+
+   assert(nents >= 1 && nents <= ARRAY_SIZE(ai));
+   assert(!(size % page_size) && !(bo_va % page_size));
+   assert(util_is_power_of_two_nonzero64(align));
+
+   for (uint32_t i = 0; i < nents; i++) {
+      ai[i] = (struct base_mem_aliasing_info){
+         .handle = bo_va,
+         .offset = 0,
+         .length = size / page_size,
+      };
+   }
+
+   /* Note: CPU_WR is not allowed on alias regions, and the source BO must
+    * be GPU-cached and share the same coherency domain. */
+   union kbase_ioctl_mem_alias req = {
+      .in = {
+         .flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                  BASE_MEM_PROT_CPU_RD,
+         .stride = size / page_size,
+         .nents = nents,
+         .aliasing_info = (uintptr_t)ai,
+      },
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALIAS, &req)) {
+      mesa_loge("kbase: KBASE_IOCTL_MEM_ALIAS failed: %s", strerror(errno));
+      return 0;
+   }
+
+   /* For 64-bit clients the alias is a SAME_VA region: out.gpu_va is a
+    * cookie and mmap()ing it establishes the mapping.  Reserve an aligned
+    * window first and map at a fixed address inside it so the caller's
+    * alignment requirement is met. */
+   if (align < page_size)
+      align = page_size;
+
+   void *reserve = mmap(NULL, total + align, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+   if (reserve == MAP_FAILED) {
+      struct kbase_ioctl_mem_free free_req = { .gpu_addr = req.out.gpu_va };
+      ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &free_req);
+      return 0;
+   }
+
+   uintptr_t aligned = ALIGN_POT((uintptr_t)reserve, (uintptr_t)align);
+
+   void *ptr = mmap((void *)aligned, total, PROT_READ, MAP_SHARED | MAP_FIXED,
+                    dev->fd, req.out.gpu_va);
+   if (ptr == MAP_FAILED) {
+      mesa_loge("kbase: mmap of alias region failed: %s", strerror(errno));
+      munmap(reserve, total + align);
+      struct kbase_ioctl_mem_free free_req = { .gpu_addr = req.out.gpu_va };
+      ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &free_req);
+      return 0;
+   }
+
+   /* Trim the reservation around the fixed mapping. */
+   if (aligned > (uintptr_t)reserve)
+      munmap(reserve, aligned - (uintptr_t)reserve);
+
+   uintptr_t reserve_end = (uintptr_t)reserve + total + align;
+   if (reserve_end > aligned + total)
+      munmap((void *)(aligned + total), reserve_end - (aligned + total));
+
+   return (uint64_t)aligned;
+}
+
+void
+kbase_kmod_alias_destroy(struct pan_kmod_dev *dev, uint64_t va, uint64_t size,
+                         uint32_t nents)
+{
+   /* SAME_VA region: munmap() tears down the GPU mapping too. */
+   munmap((void *)(uintptr_t)va, size * nents);
 }
 
 static struct pan_kmod_dev *
