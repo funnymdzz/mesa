@@ -327,6 +327,167 @@ struct kbase_ioctl_mem_exec_init {
    _IOW(KBASE_IOCTL_TYPE, 38, struct kbase_ioctl_mem_exec_init)
 
 /* -----------------------------------------------------------------------
+ * CSF command-stream submission interface (CSF flavour only).
+ *
+ * A CS queue is a ring buffer in GPU memory: REGISTER it, BIND it to a
+ * queue group (returns a cookie to mmap the USER_IO pages), then submit
+ * by writing instructions to the ring, updating CS_INSERT in the input
+ * page and KICKing the scheduler.
+ * ----------------------------------------------------------------------- */
+struct kbase_ioctl_cs_queue_register {
+   __u64 buffer_gpu_addr;
+   __u32 buffer_size;
+   __u8 priority;
+   __u8 padding[3];
+};
+#define KBASE_IOCTL_CS_QUEUE_REGISTER \
+   _IOW(KBASE_IOCTL_TYPE, 36, struct kbase_ioctl_cs_queue_register)
+
+struct kbase_ioctl_cs_queue_kick {
+   __u64 buffer_gpu_addr;
+};
+#define KBASE_IOCTL_CS_QUEUE_KICK \
+   _IOW(KBASE_IOCTL_TYPE, 37, struct kbase_ioctl_cs_queue_kick)
+
+union kbase_ioctl_cs_queue_bind {
+   struct {
+      __u64 buffer_gpu_addr;
+      __u8 group_handle;
+      __u8 csi_index;
+      __u8 padding[6];
+   } in;
+   struct {
+      __u64 mmap_handle;
+   } out;
+};
+#define KBASE_IOCTL_CS_QUEUE_BIND \
+   _IOWR(KBASE_IOCTL_TYPE, 39, union kbase_ioctl_cs_queue_bind)
+
+struct kbase_ioctl_cs_queue_terminate {
+   __u64 buffer_gpu_addr;
+};
+#define KBASE_IOCTL_CS_QUEUE_TERMINATE \
+   _IOW(KBASE_IOCTL_TYPE, 41, struct kbase_ioctl_cs_queue_terminate)
+
+/* Number of pages mmap()ed from the QUEUE_BIND cookie:
+ * page 0: doorbell (write any u32 to ring),
+ * page 1: input page (CS_INSERT at 0x0, CS_EXTRACT_INIT at 0x8),
+ * page 2: output page (CS_EXTRACT at 0x0, CS_ACTIVE at 0x8). */
+#define BASEP_QUEUE_NR_MMAP_USER_PAGES 3
+
+#define CS_USER_IO_INPUT_CS_INSERT       0x0000 /* u64, page 1 */
+#define CS_USER_IO_INPUT_CS_EXTRACT_INIT 0x0008 /* u64, page 1 */
+#define CS_USER_IO_OUTPUT_CS_EXTRACT     0x0000 /* u64, page 2 */
+#define CS_USER_IO_OUTPUT_CS_ACTIVE      0x0008 /* u32, page 2 */
+
+/* The USER register page (BASEP_MEM_CSF_USER_REG_PAGE_HANDLE mmap)
+ * exposes LATEST_FLUSH at offset 0. */
+#define CS_USER_REG_LATEST_FLUSH 0x0000 /* u32 */
+
+union kbase_ioctl_cs_queue_group_create_1_6 {
+   struct {
+      __u64 tiler_mask;
+      __u64 fragment_mask;
+      __u64 compute_mask;
+      __u8 cs_min;
+      __u8 priority;
+      __u8 tiler_max;
+      __u8 fragment_max;
+      __u8 compute_max;
+      __u8 padding[3];
+   } in;
+   struct {
+      __u8 group_handle;
+      __u8 padding[3];
+      __u32 group_uid;
+   } out;
+};
+#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6 \
+   _IOWR(KBASE_IOCTL_TYPE, 42, union kbase_ioctl_cs_queue_group_create_1_6)
+
+/* Extended version (uAPI >= 1.18) */
+union kbase_ioctl_cs_queue_group_create {
+   struct {
+      __u64 tiler_mask;
+      __u64 fragment_mask;
+      __u64 compute_mask;
+      __u8 cs_min;
+      __u8 priority;
+      __u8 tiler_max;
+      __u8 fragment_max;
+      __u8 compute_max;
+      __u8 csi_handlers;
+      __u8 padding[2];
+      __u64 reserved;
+   } in;
+   struct {
+      __u8 group_handle;
+      __u8 padding[3];
+      __u32 group_uid;
+   } out;
+};
+#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE \
+   _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create)
+
+struct kbase_ioctl_cs_queue_group_term {
+   __u8 group_handle;
+   __u8 padding[7];
+};
+#define KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE \
+   _IOW(KBASE_IOCTL_TYPE, 43, struct kbase_ioctl_cs_queue_group_term)
+
+#define KBASE_IOCTL_CS_EVENT_SIGNAL \
+   _IO(KBASE_IOCTL_TYPE, 44)
+
+typedef __u8 base_kcpu_queue_id;
+
+struct kbase_ioctl_kcpu_queue_new {
+   base_kcpu_queue_id id;
+   __u8 padding[7];
+};
+#define KBASE_IOCTL_KCPU_QUEUE_CREATE \
+   _IOR(KBASE_IOCTL_TYPE, 45, struct kbase_ioctl_kcpu_queue_new)
+
+struct kbase_ioctl_kcpu_queue_delete {
+   base_kcpu_queue_id id;
+   __u8 padding[7];
+};
+#define KBASE_IOCTL_KCPU_QUEUE_DELETE \
+   _IOW(KBASE_IOCTL_TYPE, 46, struct kbase_ioctl_kcpu_queue_delete)
+
+struct kbase_ioctl_kcpu_queue_enqueue {
+   __u64 addr;
+   __u32 nr_commands;
+   base_kcpu_queue_id id;
+   __u8 padding[3];
+};
+#define KBASE_IOCTL_KCPU_QUEUE_ENQUEUE \
+   _IOW(KBASE_IOCTL_TYPE, 47, struct kbase_ioctl_kcpu_queue_enqueue)
+
+union kbase_ioctl_cs_tiler_heap_init {
+   struct {
+      __u32 chunk_size;
+      __u32 initial_chunks;
+      __u32 max_chunks;
+      __u16 target_in_flight;
+      __u8 group_id;
+      __u8 padding;
+   } in;
+   struct {
+      __u64 gpu_heap_va;
+      __u64 first_chunk_va;
+   } out;
+};
+#define KBASE_IOCTL_CS_TILER_HEAP_INIT \
+   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init)
+
+struct kbase_ioctl_cs_tiler_heap_term {
+   __u64 gpu_heap_va;
+};
+#define KBASE_IOCTL_CS_TILER_HEAP_TERM \
+   _IOW(KBASE_IOCTL_TYPE, 49, struct kbase_ioctl_cs_tiler_heap_term)
+
+/* -----------------------------------------------------------------------
  * CSF global interface query (CSF flavour only).
  * First call with max_group_num = max_total_stream_num = 0 to learn the
  * counts (returned in out), then call again with buffers.

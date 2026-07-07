@@ -76,6 +76,9 @@ struct kbase_kmod_dev {
     * the kernel before any memory operation; unmapped at destroy time. */
    void *tracking_page;
 
+   /* CSF USER register page (LATEST_FLUSH etc.), CSF only. */
+   void *user_reg_page;
+
    /* Monotonically-increasing handle counter.
     * kbase has no GEM handles; we mint our own u32 handles for use with the
     * pan_kmod handle_to_bo sparse array. */
@@ -416,6 +419,189 @@ kbase_kmod_get_csif_props(const struct pan_kmod_dev *dev)
    return &kbase_dev->csif_info;
 }
 
+uint32_t
+kbase_kmod_get_flush_id(const struct pan_kmod_dev *dev)
+{
+   struct kbase_kmod_dev *kbase_dev =
+      container_of(dev, struct kbase_kmod_dev, base);
+
+   if (!kbase_dev->user_reg_page)
+      return 0;
+
+   return *(volatile uint32_t *)((uint8_t *)kbase_dev->user_reg_page +
+                                 CS_USER_REG_LATEST_FLUSH);
+}
+
+/* -------------------------------------------------------------------------
+ * CSF queue group / queue / tiler heap primitives
+ * ---------------------------------------------------------------------- */
+
+int
+kbase_kmod_csf_group_create(struct pan_kmod_dev *dev, uint32_t cs_queue_count,
+                            uint32_t *group_handle)
+{
+   /* Endpoint masks/maxes match what panfork uses on all CSF parts:
+    * a single tiler unit, all fragment/compute endpoints. */
+   union kbase_ioctl_cs_queue_group_create_1_6 req = {
+      .in = {
+         .tiler_mask = 1,
+         .fragment_mask = ~0ull,
+         .compute_mask = ~0ull,
+         .cs_min = cs_queue_count,
+         .priority = 1,
+         .tiler_max = 1,
+         .fragment_max = 64,
+         .compute_max = 64,
+      },
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6, &req)) {
+      mesa_loge("kbase: KBASE_IOCTL_CS_QUEUE_GROUP_CREATE failed: %s",
+                strerror(errno));
+      return -1;
+   }
+
+   *group_handle = req.out.group_handle;
+   return 0;
+}
+
+void
+kbase_kmod_csf_group_destroy(struct pan_kmod_dev *dev, uint32_t group_handle)
+{
+   struct kbase_ioctl_cs_queue_group_term req = {
+      .group_handle = group_handle,
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &req))
+      mesa_loge("kbase: KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE failed: %s",
+                strerror(errno));
+}
+
+void *
+kbase_kmod_csf_queue_bind(struct pan_kmod_dev *dev, uint32_t group_handle,
+                          uint32_t csi_index, uint64_t ringbuf_va,
+                          uint32_t ringbuf_size)
+{
+   struct kbase_ioctl_cs_queue_register reg = {
+      .buffer_gpu_addr = ringbuf_va,
+      .buffer_size = ringbuf_size,
+      .priority = 1,
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_REGISTER, &reg)) {
+      mesa_loge("kbase: KBASE_IOCTL_CS_QUEUE_REGISTER failed: %s",
+                strerror(errno));
+      return NULL;
+   }
+
+   union kbase_ioctl_cs_queue_bind bind = {
+      .in = {
+         .buffer_gpu_addr = ringbuf_va,
+         .group_handle = group_handle,
+         .csi_index = csi_index,
+      },
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_BIND, &bind)) {
+      mesa_loge("kbase: KBASE_IOCTL_CS_QUEUE_BIND failed: %s",
+                strerror(errno));
+      goto err_term_queue;
+   }
+
+   void *user_io = mmap(NULL, BASEP_QUEUE_NR_MMAP_USER_PAGES * 4096,
+                        PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd,
+                        bind.out.mmap_handle);
+   if (user_io == MAP_FAILED) {
+      mesa_loge("kbase: mmap of CS USER_IO pages failed: %s",
+                strerror(errno));
+      goto err_term_queue;
+   }
+
+   return user_io;
+
+err_term_queue:
+   {
+      struct kbase_ioctl_cs_queue_terminate term = {
+         .buffer_gpu_addr = ringbuf_va,
+      };
+      ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &term);
+   }
+   return NULL;
+}
+
+void
+kbase_kmod_csf_queue_term(struct pan_kmod_dev *dev, uint64_t ringbuf_va,
+                          void *user_io)
+{
+   if (user_io)
+      munmap(user_io, BASEP_QUEUE_NR_MMAP_USER_PAGES * 4096);
+
+   struct kbase_ioctl_cs_queue_terminate term = {
+      .buffer_gpu_addr = ringbuf_va,
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &term))
+      mesa_loge("kbase: KBASE_IOCTL_CS_QUEUE_TERMINATE failed: %s",
+                strerror(errno));
+}
+
+int
+kbase_kmod_csf_queue_kick(struct pan_kmod_dev *dev, uint64_t ringbuf_va)
+{
+   struct kbase_ioctl_cs_queue_kick kick = {
+      .buffer_gpu_addr = ringbuf_va,
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick)) {
+      mesa_loge("kbase: KBASE_IOCTL_CS_QUEUE_KICK failed: %s",
+                strerror(errno));
+      return -1;
+   }
+
+   return 0;
+}
+
+int
+kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
+                                 uint32_t chunk_size, uint32_t initial_chunks,
+                                 uint32_t max_chunks,
+                                 uint32_t target_in_flight,
+                                 uint64_t *heap_ctx_va,
+                                 uint64_t *first_chunk_va)
+{
+   union kbase_ioctl_cs_tiler_heap_init req = {
+      .in = {
+         .chunk_size = chunk_size,
+         .initial_chunks = initial_chunks,
+         .max_chunks = max_chunks,
+         .target_in_flight = MIN2(target_in_flight, UINT16_MAX),
+      },
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req)) {
+      mesa_loge("kbase: KBASE_IOCTL_CS_TILER_HEAP_INIT failed: %s",
+                strerror(errno));
+      return -1;
+   }
+
+   *heap_ctx_va = req.out.gpu_heap_va;
+   *first_chunk_va = req.out.first_chunk_va;
+   return 0;
+}
+
+void
+kbase_kmod_csf_tiler_heap_destroy(struct pan_kmod_dev *dev,
+                                  uint64_t heap_ctx_va)
+{
+   struct kbase_ioctl_cs_tiler_heap_term req = {
+      .gpu_heap_va = heap_ctx_va,
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_TERM, &req))
+      mesa_loge("kbase: KBASE_IOCTL_CS_TILER_HEAP_TERM failed: %s",
+                strerror(errno));
+}
+
 static struct pan_kmod_dev *
 kbase_kmod_dev_create(int fd, uint32_t flags,
                       UNUSED const struct pan_kmod_driver *drv_info,
@@ -520,6 +706,20 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
       return NULL;
    }
 
+   if (is_csf) {
+      /* Map the CSF USER register page for LATEST_FLUSH reads.  Failure is
+       * non-fatal: kbase_kmod_get_flush_id() then returns 0, which just
+       * makes FLUSH_CACHE2 waits more conservative. */
+      kbase_dev->user_reg_page =
+         mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd,
+              BASEP_MEM_CSF_USER_REG_PAGE_HANDLE);
+      if (kbase_dev->user_reg_page == MAP_FAILED) {
+         mesa_logw("kbase: mmap of the CSF USER register page failed: %s",
+                   strerror(errno));
+         kbase_dev->user_reg_page = NULL;
+      }
+   }
+
    kbase_dev_query_props(kbase_dev, props_buf, props_size);
    free(props_buf);
 
@@ -546,6 +746,9 @@ kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
 {
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
+
+   if (kbase_dev->user_reg_page)
+      munmap(kbase_dev->user_reg_page, 4096);
 
    if (kbase_dev->tracking_page)
       munmap(kbase_dev->tracking_page, 4096);

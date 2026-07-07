@@ -64,6 +64,27 @@ struct panvk_subqueue {
          void *host;
       } addr;
    } tracebuf;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* kbase-backed queues manage the CS ring buffer in userspace (the
+    * panthor kernel driver does the equivalent in kernel-owned rings). */
+   struct {
+      struct pan_kmod_bo *ringbuf_bo;
+      void *ringbuf_cpu;
+      uint64_t ringbuf_dev;
+
+      /* USER_IO pages from KBASE_IOCTL_CS_QUEUE_BIND: doorbell page,
+       * input page (CS_INSERT), output page (CS_EXTRACT/CS_ACTIVE). */
+      void *user_io;
+
+      /* Monotonically-increasing byte offset of the next ring entry. */
+      uint64_t insert;
+
+      /* Number of jobs emitted; each bumps the subqueue seqno cell by one
+       * when it retires. */
+      uint64_t emitted_jobs;
+   } kbase;
+#endif
 };
 
 struct panvk_desc_ringbuf {
@@ -85,6 +106,12 @@ struct panvk_gpu_queue {
    struct panvk_tiler_heap tiler_heap;
    struct panvk_desc_ringbuf render_desc_ringbuf;
    struct panvk_priv_mem syncobjs;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* Per-subqueue completion seqno cells (panvk_cs_sync64 layout), bumped
+    * by a SYNC_ADD64 at the end of every ring entry and polled by the CPU. */
+   struct panvk_priv_mem kbase_seqnos;
+#endif
 
    struct {
       struct vk_sync *sync;

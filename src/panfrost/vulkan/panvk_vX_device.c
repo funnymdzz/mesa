@@ -301,10 +301,10 @@ panvk_device_get_timestamp(struct vk_device *vk_dev, uint64_t *timestamp)
 }
 
 #ifdef HAVE_PAN_KMOD_KBASE
-/* Command submission over kbase (CSF queue groups, ring buffers, real
- * synchronization) is not implemented yet.  So that device creation — and
- * with it tools like vulkaninfo — works, queues are created as stubs that
- * fail at submit time with a clear message. */
+/* Sparse binding over kbase (which has no DRM syncobjs and no explicit-VA
+ * vm_bind) is not implemented yet: the BIND queue family is created as a
+ * stub that fails at submit time with a clear message.  The GPU queue
+ * family uses the real kbase CSF submission path. */
 static bool
 panvk_kbase_stub_queues(const struct panvk_device *dev)
 {
@@ -319,7 +319,7 @@ panvk_kbase_stub_queue_submit(struct vk_queue *queue,
                               struct vk_queue_submit *submit)
 {
    return vk_queue_set_lost(
-      queue, "kbase: command submission is not implemented yet");
+      queue, "kbase: sparse binding queues are not implemented yet");
 }
 
 static VkResult
@@ -361,7 +361,8 @@ panvk_queue_create(struct panvk_device *dev,
                    struct vk_queue **out_queue)
 {
 #ifdef HAVE_PAN_KMOD_KBASE
-   if (panvk_kbase_stub_queues(dev))
+   if (panvk_kbase_stub_queues(dev) &&
+       create_info->queueFamilyIndex == PANVK_QUEUE_FAMILY_BIND)
       return panvk_kbase_stub_queue_create(dev, create_info, queue_idx,
                                            out_queue);
 #endif
@@ -384,7 +385,8 @@ panvk_queue_destroy(struct vk_queue *queue)
 #ifdef HAVE_PAN_KMOD_KBASE
    struct panvk_device *dev = to_panvk_device(queue->base.device);
 
-   if (panvk_kbase_stub_queues(dev)) {
+   if (panvk_kbase_stub_queues(dev) &&
+       queue->queue_family_index == PANVK_QUEUE_FAMILY_BIND) {
       panvk_kbase_stub_queue_destroy(queue);
       return;
    }
