@@ -266,6 +266,23 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
 
    cs_builder_init(&b, &conf, ring_buf);
 
+   /* The kbase wrapper executes LS stores, waits, flushes and the final
+    * deferred sync before/around the called PanVK stream.  The normal PanVK
+    * init stream also programs these scoreboard slots, but on kbase that
+    * stream is reached through this wrapper, so the wrapper has to make its
+    * own async slots valid first. */
+#if PAN_ARCH >= 11
+   cs_set_state_imm32(&b, MALI_CS_SET_STATE_TYPE_SB_SEL_ENDPOINT, SB_ITER(0));
+   cs_set_state_imm32(&b, MALI_CS_SET_STATE_TYPE_SB_MASK_WAIT, SB_WAIT_ITER(0));
+   cs_set_state_imm32(&b, MALI_CS_SET_STATE_TYPE_SB_SEL_OTHER, SB_ID(LS));
+   cs_set_state_imm32(&b, MALI_CS_SET_STATE_TYPE_SB_SEL_DEFERRED,
+                      SB_ID(DEFERRED_SYNC));
+   cs_set_state_imm32(&b, MALI_CS_SET_STATE_TYPE_SB_MASK_STREAM,
+                      dev->csf.sb.all_iters_mask & ~SB_WAIT_ITER(0));
+#else
+   cs_set_scoreboard_entry(&b, SB_ITER(0), SB_ID(LS));
+#endif
+
    /* kbase userspace-owned queues need their resource requirements to be
     * declared in the queue ring itself before ordinary commands are run.
     * The panthor kernel path owns that scheduling contract internally, but on
