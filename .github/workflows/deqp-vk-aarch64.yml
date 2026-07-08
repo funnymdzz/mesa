@@ -44,7 +44,7 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DDEQP_TARGET=surfaceless \
+            -DDEQP_TARGET=default \
             -DSELECTED_BUILD_TARGETS=deqp-vk
 
       - name: Build deqp-vk
