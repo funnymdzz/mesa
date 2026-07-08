@@ -47,11 +47,11 @@
  * the USER_IO input page and kick the scheduler.
  *
  * Synchronization is currently fully synchronous: every submission is
- * CPU-waited (by polling a per-subqueue seqno cell bumped by a deferred
- * SYNC_ADD64 that waits on all scoreboard slots first, mirroring the
- * sequence the panthor kernel emits), and semaphore waits/signals are
- * resolved on the CPU.  Asynchronous submission needs a real kbase
- * fence/event integration and is left for later.
+ * CPU-waited (by polling the kbase CS_EXTRACT pointer and, where visible,
+ * a per-subqueue seqno cell bumped by a deferred SYNC_ADD64 that waits on
+ * all scoreboard slots first), and semaphore waits/signals are resolved on
+ * the CPU.  Asynchronous submission needs a real kbase fence/event
+ * integration and is left for later.
  */
 
 #define KBASE_RINGBUF_SIZE     (64 * 1024)
@@ -187,11 +187,12 @@ kbase_init_seqnos(struct panvk_gpu_queue *queue)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
 
-   /* GPU-uncached so the SYNC_ADD64 lands straight in memory where the
-    * CPU poll can see it, instead of lingering in the GPU L2. */
+   /* Keep the seqno/diagnostic cells on the same normal kbase memory path as
+    * CS rings and private pools.  Some Android kbase stacks expose
+    * GPU-uncached BOs differently enough that CS LS/SYNC writes don't become
+    * observable from userspace. */
    queue->kbase_seqnos.bo =
-      pan_kmod_bo_alloc(dev->kmod.dev, dev->kmod.vm, 4096,
-                        PAN_KMOD_BO_FLAG_GPU_UNCACHED);
+      pan_kmod_bo_alloc(dev->kmod.dev, dev->kmod.vm, 4096, 0);
    if (!queue->kbase_seqnos.bo)
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to allocate kbase seqno cells");
@@ -444,15 +445,24 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
    volatile uint64_t *mark_post_wait =
       (volatile uint64_t *)((volatile uint8_t *)cell +
                             KBASE_SEQNO_MARK_POST_WAIT_OFFSET);
+   const uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
+   uint64_t target_seqno = subq->kbase.emitted_jobs;
+   uint64_t target_insert = subq->kbase.insert;
    int64_t start = os_time_get_nano();
    int64_t last_kick = start;
 
-   /* Completion is signaled through both a SYNC_ADD64 (cell->seqno) and a
-    * plain LS store (ls_copy); accept whichever lands first. */
+   /* Completion is signaled through CS_EXTRACT, and also through a SYNC_ADD64
+    * (cell->seqno) plus a plain LS store (ls_copy) when those writes are
+    * visible through the proprietary kbase memory mapping. */
    while (true) {
+      uint64_t extract = *(volatile uint64_t *)(output_page +
+                                                CS_USER_IO_OUTPUT_CS_EXTRACT);
+      uint32_t active = *(volatile uint32_t *)(output_page +
+                                               CS_USER_IO_OUTPUT_CS_ACTIVE);
+
       kbase_cache_invalidate_range((const void *)cell, kbase_seqno_stride());
-      if (cell->seqno >= subq->kbase.emitted_jobs ||
-          *ls_copy >= subq->kbase.emitted_jobs)
+      if (extract >= target_insert || cell->seqno >= target_seqno ||
+          *ls_copy >= target_seqno)
          break;
 
       if (cell->error) {
@@ -473,11 +483,6 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
       }
 
       if (now - start > KBASE_WAIT_TIMEOUT_NS) {
-         const uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
-         uint64_t extract = *(volatile uint64_t *)(output_page +
-                                                   CS_USER_IO_OUTPUT_CS_EXTRACT);
-         uint32_t active = *(volatile uint32_t *)(output_page +
-                                                  CS_USER_IO_OUTPUT_CS_ACTIVE);
          const volatile uint64_t *ring = subq->kbase.ringbuf_cpu;
 
          /* Log directly: on queue-init failures the vk_queue_set_lost
@@ -491,8 +496,8 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
                    ", ring[0..3] 0x%" PRIx64 "/0x%" PRIx64
                    "/0x%" PRIx64 "/0x%" PRIx64,
                    subqueue, (uint64_t)cell->seqno, *ls_copy,
-                   subq->kbase.emitted_jobs, *mark_pre_call, *mark_post_call,
-                   *mark_post_wait, subq->kbase.insert, extract, active,
+                   target_seqno, *mark_pre_call, *mark_post_call,
+                   *mark_post_wait, target_insert, extract, active,
                    cell->error, ring[0], ring[1], ring[2], ring[3]);
 
          return vk_queue_set_lost(&queue->vk,
