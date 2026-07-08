@@ -153,11 +153,12 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
 
    if (stream_size) {
       /* Make CPU-written command-stream/descriptor memory visible to the
-       * GPU before calling into it. */
+       * GPU before calling into it (0x233 flush, same as the panthor
+       * kernel: clean+invalidate L2/LSC, invalidate other caches). */
       cs_move32_to(&b, val32, flush_id);
       cs_flush_caches(&b, MALI_CS_FLUSH_MODE_CLEAN_AND_INVALIDATE,
                       MALI_CS_FLUSH_MODE_CLEAN_AND_INVALIDATE,
-                      MALI_CS_OTHER_FLUSH_MODE_NONE, val32,
+                      MALI_CS_OTHER_FLUSH_MODE_INVALIDATE, val32,
                       cs_defer(0, SB_ID(IMM_FLUSH)));
       cs_wait_slot(&b, SB_ID(IMM_FLUSH));
 
@@ -177,15 +178,28 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    cs_sync64_add(&b, true, MALI_CS_SYNC_SCOPE_SYSTEM, val64, addr64,
                  cs_defer(0, SB_ID(DEFERRED_SYNC)));
 
+   /* Fault-recovery boundary, matching the panthor kernel sequence. */
+   cs_error_barrier(&b);
+
    cs_end(&b);
 
    if (!cs_is_valid(&b))
       return panvk_errorf(dev, VK_ERROR_UNKNOWN,
                           "kbase: CS ring emission failed");
 
-   assert(cs_root_chunk_size(&b) <= KBASE_RING_JOB_MAX_SIZE);
+   uint32_t entry_size = cs_root_chunk_size(&b);
+   assert(entry_size <= KBASE_RING_JOB_MAX_SIZE);
 
-   subq->kbase.insert += cs_root_chunk_size(&b);
+   /* Ring entries must be cacheline-aligned to please the CS prefetcher
+    * (the panthor kernel pads its ring slots the same way).  The pad is
+    * zero-filled, i.e. NOPs. */
+   uint32_t padded_size = ALIGN_POT(entry_size, 64);
+   if (padded_size != entry_size) {
+      memset((uint8_t *)subq->kbase.ringbuf_cpu + offset + entry_size, 0,
+             padded_size - entry_size);
+   }
+
+   subq->kbase.insert += padded_size;
    subq->kbase.emitted_jobs++;
    return VK_SUCCESS;
 }
