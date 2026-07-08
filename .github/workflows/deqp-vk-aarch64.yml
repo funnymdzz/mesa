@@ -25,6 +25,8 @@ jobs:
             ca-certificates \
             cmake \
             git \
+            libegl-dev \
+            libgles-dev \
             ninja-build \
             pkgconf \
             python3 \
@@ -44,7 +46,7 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DDEQP_TARGET=default \
+            -DDEQP_TARGET=surfaceless \
             -DSELECTED_BUILD_TARGETS=deqp-vk
 
       - name: Build deqp-vk
