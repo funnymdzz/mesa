@@ -461,6 +461,7 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
                                                    CS_USER_IO_OUTPUT_CS_EXTRACT);
          uint32_t active = *(volatile uint32_t *)(output_page +
                                                   CS_USER_IO_OUTPUT_CS_ACTIVE);
+         const volatile uint64_t *ring = subq->kbase.ringbuf_cpu;
 
          /* Log directly: on queue-init failures the vk_queue_set_lost
           * message never reaches the user. */
@@ -469,11 +470,13 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
                    ", marks pre/post-call/post-wait 0x%" PRIx64
                    "/0x%" PRIx64 "/0x%" PRIx64
                    ", insert %" PRIu64 ", extract %" PRIu64
-                   ", active %u, error 0x%x",
+                   ", active %u, error 0x%x"
+                   ", ring[0..3] 0x%" PRIx64 "/0x%" PRIx64
+                   "/0x%" PRIx64 "/0x%" PRIx64,
                    subqueue, (uint64_t)cell->seqno, *ls_copy,
                    subq->kbase.emitted_jobs, *mark_pre_call, *mark_post_call,
                    *mark_post_wait, subq->kbase.insert, extract, active,
-                   cell->error);
+                   cell->error, ring[0], ring[1], ring[2], ring[3]);
 
          return vk_queue_set_lost(&queue->vk,
                                   "kbase: timeout on subqueue %u", subqueue);
@@ -529,7 +532,7 @@ kbase_create_group(struct panvk_gpu_queue *queue)
 
       subq->kbase.ringbuf_bo =
          pan_kmod_bo_alloc(dev->kmod.dev, dev->kmod.vm, KBASE_RINGBUF_SIZE,
-                           PAN_KMOD_BO_FLAG_GPU_UNCACHED);
+                           0);
       if (!subq->kbase.ringbuf_bo) {
          result = panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                                "Failed to allocate a kbase CS ring buffer");
