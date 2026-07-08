@@ -166,11 +166,16 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
       cs_call(&b, addr64, val32);
    }
 
-   /* Bump the subqueue seqno once all prior operations retired. */
+   /* Bump the subqueue seqno once all prior operations retired: an
+    * explicit WAIT on all scoreboard slots followed by a SYNC_ADD64 with
+    * an empty wait mask, matching the sequence the panthor kernel emits
+    * (the wait mask of a deferred op must not include its own signal
+    * slot, so waiting through the defer isn't an option). */
    cs_move64_to(&b, addr64, kbase_subqueue_seqno_dev_addr(queue, subqueue));
    cs_move64_to(&b, val64, 1);
+   cs_wait_slots(&b, dev->csf.sb.all_mask);
    cs_sync64_add(&b, true, MALI_CS_SYNC_SCOPE_SYSTEM, val64, addr64,
-                 cs_defer(dev->csf.sb.all_mask, SB_ID(DEFERRED_SYNC)));
+                 cs_defer(0, SB_ID(DEFERRED_SYNC)));
 
    cs_end(&b);
 
