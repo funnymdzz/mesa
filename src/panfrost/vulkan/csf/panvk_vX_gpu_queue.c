@@ -67,6 +67,25 @@ gpu_queue_uses_kbase(const struct panvk_device *dev)
           '\0';
 }
 
+/* Barrier that drains CPU (write-combine) stores all the way to the point
+ * of coherency shared with the GPU before the doorbell/kick is observed.
+ * The Mali GPU sits in the outer/system shareability domain, so the inner-
+ * shareable DMB that __sync_synchronize() emits on aarch64 is not enough:
+ * the ring-buffer writes could still be sitting in the CPU write-combine
+ * buffer when the firmware reads the ring from DRAM (it would then execute
+ * zero-filled NOPs and idle without touching memory).  DSB SY drains them. */
+static inline void
+kbase_gpu_wmb(void)
+{
+#if defined(__aarch64__)
+   __asm__ volatile("dsb sy" ::: "memory");
+#elif defined(__arm__)
+   __asm__ volatile("dsb sy" ::: "memory");
+#else
+   __sync_synchronize();
+#endif
+}
+
 static uint32_t
 kbase_seqno_stride(void)
 {
@@ -249,6 +268,10 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
              padded_size - entry_size);
    }
 
+   /* Drain this entry to GPU-visible memory now, so it is in place before
+    * kbase_subqueue_publish() moves the insert offset and kicks. */
+   kbase_gpu_wmb();
+
    subq->kbase.insert += padded_size;
    subq->kbase.emitted_jobs++;
    return VK_SUCCESS;
@@ -263,13 +286,16 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
    uint8_t *input_page = (uint8_t *)subq->kbase.user_io + 4096;
 
-   /* Ring contents must be visible before the insert offset moves. */
-   __sync_synchronize();
+   /* Drain the ring writes all the way to GPU-visible memory before the
+    * insert offset moves — an inner-shareable barrier is not enough (see
+    * kbase_gpu_wmb). */
+   kbase_gpu_wmb();
 
    *(volatile uint64_t *)(input_page + CS_USER_IO_INPUT_CS_INSERT) =
       subq->kbase.insert;
 
-   __sync_synchronize();
+   /* And make the new insert offset itself visible before the kick. */
+   kbase_gpu_wmb();
 
    kbase_kmod_csf_queue_kick(dev->kmod.dev, subq->kbase.ringbuf_dev);
 }
