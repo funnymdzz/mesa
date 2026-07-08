@@ -182,6 +182,14 @@ kbase_subqueue_seqno_dev_addr(struct panvk_gpu_queue *queue, uint32_t subqueue)
    return queue->kbase_seqnos.dev + subqueue * kbase_seqno_stride();
 }
 
+static uint64_t
+kbase_ring_qword(const struct panvk_subqueue *subq, uint64_t byte_offset)
+{
+   uint64_t off = byte_offset % KBASE_RINGBUF_SIZE;
+
+   return *(volatile uint64_t *)((uint8_t *)subq->kbase.ringbuf_cpu + off);
+}
+
 static VkResult
 kbase_init_seqnos(struct panvk_gpu_queue *queue)
 {
@@ -387,6 +395,13 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
              padded_size - entry_size);
    }
 
+   subq->kbase.last_job_offset = offset;
+   subq->kbase.last_job_size = padded_size;
+   subq->kbase.last_job_entry_size = entry_size;
+   subq->kbase.last_stream_addr = stream_addr;
+   subq->kbase.last_stream_size = stream_size;
+   subq->kbase.last_flush_id = flush_id;
+
    /* kbase queue rings follow the proprietary userspace model: CPU-written
     * ring cachelines must be explicitly cleaned before the firmware is
     * notified through USER_IO, even when the BO is not advertised as a Mesa
@@ -396,6 +411,13 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
 
    subq->kbase.insert += padded_size;
    subq->kbase.emitted_jobs++;
+
+   mesa_logd("kbase: emitted subqueue %u job %" PRIu64
+             ": ring offset %u, entry %u/%u bytes, stream 0x%" PRIx64
+             "/%u, flush %u",
+             subqueue, subq->kbase.emitted_jobs, offset, entry_size,
+             padded_size, stream_addr, stream_size, flush_id);
+
    return VK_SUCCESS;
 }
 
@@ -427,7 +449,8 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
 }
 
 static VkResult
-kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
+kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
+                         uint32_t rekick_mask)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
@@ -478,12 +501,17 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
       /* Re-kick periodically: a kick can race with an in-flight group
        * suspend and get dropped. */
       if (now - last_kick > 500ll * 1000000ll) {
-         kbase_kmod_csf_queue_kick(dev->kmod.dev, subq->kbase.ringbuf_dev);
+         u_foreach_bit(i, rekick_mask) {
+            kbase_kmod_csf_queue_kick(
+               dev->kmod.dev, queue->subqueues[i].kbase.ringbuf_dev);
+         }
          last_kick = now;
       }
 
       if (now - start > KBASE_WAIT_TIMEOUT_NS) {
          const volatile uint64_t *ring = subq->kbase.ringbuf_cpu;
+         uint64_t extract_line = extract & ~(uint64_t)63;
+         uint64_t last_off = subq->kbase.last_job_offset;
 
          /* Log directly: on queue-init failures the vk_queue_set_lost
           * message never reaches the user. */
@@ -499,6 +527,45 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
                    target_seqno, *mark_pre_call, *mark_post_call,
                    *mark_post_wait, target_insert, extract, active,
                    cell->error, ring[0], ring[1], ring[2], ring[3]);
+         mesa_loge("kbase: last job on subqueue %u: ring offset %u, entry "
+                   "%u/%u bytes, stream 0x%" PRIx64 "/%u, flush %u, "
+                   "extract offset %" PRIu64,
+                   subqueue, subq->kbase.last_job_offset,
+                   subq->kbase.last_job_entry_size, subq->kbase.last_job_size,
+                   subq->kbase.last_stream_addr, subq->kbase.last_stream_size,
+                   subq->kbase.last_flush_id, extract % KBASE_RINGBUF_SIZE);
+         mesa_loge("kbase: last ring[0..15] 0x%" PRIx64 "/0x%" PRIx64
+                   "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+                   "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+                   "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+                   "/0x%" PRIx64 "/0x%" PRIx64,
+                   kbase_ring_qword(subq, last_off + 0),
+                   kbase_ring_qword(subq, last_off + 8),
+                   kbase_ring_qword(subq, last_off + 16),
+                   kbase_ring_qword(subq, last_off + 24),
+                   kbase_ring_qword(subq, last_off + 32),
+                   kbase_ring_qword(subq, last_off + 40),
+                   kbase_ring_qword(subq, last_off + 48),
+                   kbase_ring_qword(subq, last_off + 56),
+                   kbase_ring_qword(subq, last_off + 64),
+                   kbase_ring_qword(subq, last_off + 72),
+                   kbase_ring_qword(subq, last_off + 80),
+                   kbase_ring_qword(subq, last_off + 88),
+                   kbase_ring_qword(subq, last_off + 96),
+                   kbase_ring_qword(subq, last_off + 104),
+                   kbase_ring_qword(subq, last_off + 112),
+                   kbase_ring_qword(subq, last_off + 120));
+         mesa_loge("kbase: extract line ring[0..7] 0x%" PRIx64 "/0x%" PRIx64
+                   "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+                   "/0x%" PRIx64 "/0x%" PRIx64,
+                   kbase_ring_qword(subq, extract_line + 0),
+                   kbase_ring_qword(subq, extract_line + 8),
+                   kbase_ring_qword(subq, extract_line + 16),
+                   kbase_ring_qword(subq, extract_line + 24),
+                   kbase_ring_qword(subq, extract_line + 32),
+                   kbase_ring_qword(subq, extract_line + 40),
+                   kbase_ring_qword(subq, extract_line + 48),
+                   kbase_ring_qword(subq, extract_line + 56));
 
          return vk_queue_set_lost(&queue->vk,
                                   "kbase: timeout on subqueue %u", subqueue);
@@ -890,7 +957,7 @@ kbase_submit_init_subqueues(struct panvk_gpu_queue *queue)
       kbase_subqueue_publish(queue, i);
 
    u_foreach_bit(i, touched) {
-      VkResult res = kbase_subqueue_wait_idle(queue, i);
+      VkResult res = kbase_subqueue_wait_idle(queue, i, touched);
       if (res != VK_SUCCESS)
          return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
                              "Failed to initialize subqueue");
@@ -2013,7 +2080,7 @@ panvk_queue_submit_ioctl_kbase(struct panvk_queue_submit *submit,
       kbase_subqueue_publish(queue, i);
 
    u_foreach_bit(i, touched) {
-      result = kbase_subqueue_wait_idle(queue, i);
+      result = kbase_subqueue_wait_idle(queue, i, touched);
       if (result != VK_SUCCESS)
          return result;
    }

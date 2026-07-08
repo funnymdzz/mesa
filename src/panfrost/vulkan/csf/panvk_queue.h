@@ -84,6 +84,13 @@ struct panvk_subqueue {
        * when it retires. */
       uint64_t emitted_jobs;
 
+      uint32_t last_job_offset;
+      uint32_t last_job_size;
+      uint32_t last_job_entry_size;
+      uint32_t last_stream_size;
+      uint32_t last_flush_id;
+      uint64_t last_stream_addr;
+
       struct panvk_priv_mem init_cs;
       uint64_t init_stream_addr;
       uint32_t init_stream_size;
