@@ -55,10 +55,19 @@
  */
 
 #define KBASE_RINGBUF_SIZE     (64 * 1024)
-/* Worst-case size of one ring entry, in bytes. */
-#define KBASE_RING_JOB_MAX_SIZE 256
+/* Worst-case size of one ring entry, in bytes. Diagnostic breadcrumbs add a
+ * few extra LS stores, so keep this conservatively above the normal panthor
+ * kernel ring slot size. */
+#define KBASE_RING_JOB_MAX_SIZE 512
 /* Generous timeout for the synchronous submission model. */
 #define KBASE_WAIT_TIMEOUT_NS  (10ll * 1000000000ll)
+#define KBASE_SEQNO_LS_COPY_OFFSET       16
+#define KBASE_SEQNO_MARK_PRE_CALL_OFFSET 24
+#define KBASE_SEQNO_MARK_POST_CALL_OFFSET 32
+#define KBASE_SEQNO_MARK_POST_WAIT_OFFSET 40
+#define KBASE_SEQNO_MARK_PRE_CALL  0x1000000000000000ull
+#define KBASE_SEQNO_MARK_POST_CALL 0x2000000000000000ull
+#define KBASE_SEQNO_MARK_POST_WAIT 0x3000000000000000ull
 
 static bool
 gpu_queue_uses_kbase(const struct panvk_device *dev)
@@ -210,6 +219,16 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
       .size = 2,
       .reg = reg + 2,
    };
+   uint64_t seqno_addr = kbase_subqueue_seqno_dev_addr(queue, subqueue);
+   uint64_t target_seqno = subq->kbase.emitted_jobs + 1;
+
+   /* Diagnostic breadcrumbs in the seqno cell. If completion times out, these
+    * tell us whether the ring entry started, whether the called stream
+    * returned, and whether the final all-scoreboard wait completed. */
+   cs_move64_to(&b, addr64, seqno_addr);
+   cs_move64_to(&b, val64, KBASE_SEQNO_MARK_PRE_CALL | target_seqno);
+   cs_store64(&b, val64, addr64, KBASE_SEQNO_MARK_PRE_CALL_OFFSET);
+   cs_wait_slot(&b, SB_ID(LS));
 
    if (stream_size) {
       /* Make CPU-written command-stream/descriptor memory visible to the
@@ -227,6 +246,11 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
       cs_call(&b, addr64, val32);
    }
 
+   cs_move64_to(&b, addr64, seqno_addr);
+   cs_move64_to(&b, val64, KBASE_SEQNO_MARK_POST_CALL | target_seqno);
+   cs_store64(&b, val64, addr64, KBASE_SEQNO_MARK_POST_CALL_OFFSET);
+   cs_wait_slot(&b, SB_ID(LS));
+
    /* Signal completion once all prior operations retired: an explicit
     * WAIT on all scoreboard slots, then a plain LS store of the absolute
     * seqno (offset 16 in the cell), then a SYNC_ADD64 on the cell proper
@@ -238,10 +262,13 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
     * "never ran".  Nothing is emitted after the SYNC_ADD64 (except the
     * register-less ERROR_BARRIER) so its operands can't be clobbered
     * while the deferred op is in flight. */
-   cs_move64_to(&b, addr64, kbase_subqueue_seqno_dev_addr(queue, subqueue));
-   cs_move64_to(&b, val64, subq->kbase.emitted_jobs + 1);
+   cs_move64_to(&b, addr64, seqno_addr);
    cs_wait_slots(&b, dev->csf.sb.all_mask);
-   cs_store64(&b, val64, addr64, 16);
+   cs_move64_to(&b, val64, KBASE_SEQNO_MARK_POST_WAIT | target_seqno);
+   cs_store64(&b, val64, addr64, KBASE_SEQNO_MARK_POST_WAIT_OFFSET);
+   cs_wait_slot(&b, SB_ID(LS));
+   cs_move64_to(&b, val64, target_seqno);
+   cs_store64(&b, val64, addr64, KBASE_SEQNO_LS_COPY_OFFSET);
    cs_wait_slot(&b, SB_ID(LS));
    cs_move64_to(&b, val64, 1);
    cs_sync64_add(&b, true, MALI_CS_SYNC_SCOPE_SYSTEM, val64, addr64,
@@ -308,7 +335,17 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
    volatile struct panvk_cs_sync64 *cell =
       kbase_subqueue_seqno_cell(queue, subqueue);
    volatile uint64_t *ls_copy =
-      (volatile uint64_t *)((volatile uint8_t *)cell + 16);
+      (volatile uint64_t *)((volatile uint8_t *)cell +
+                            KBASE_SEQNO_LS_COPY_OFFSET);
+   volatile uint64_t *mark_pre_call =
+      (volatile uint64_t *)((volatile uint8_t *)cell +
+                            KBASE_SEQNO_MARK_PRE_CALL_OFFSET);
+   volatile uint64_t *mark_post_call =
+      (volatile uint64_t *)((volatile uint8_t *)cell +
+                            KBASE_SEQNO_MARK_POST_CALL_OFFSET);
+   volatile uint64_t *mark_post_wait =
+      (volatile uint64_t *)((volatile uint8_t *)cell +
+                            KBASE_SEQNO_MARK_POST_WAIT_OFFSET);
    int64_t start = os_time_get_nano();
    int64_t last_kick = start;
 
@@ -344,11 +381,14 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
           * message never reaches the user. */
          mesa_loge("kbase: timeout on subqueue %u: seqno %" PRIu64
                    ", ls_copy %" PRIu64 ", target %" PRIu64
+                   ", marks pre/post-call/post-wait 0x%" PRIx64
+                   "/0x%" PRIx64 "/0x%" PRIx64
                    ", insert %" PRIu64 ", extract %" PRIu64
                    ", active %u, error 0x%x",
                    subqueue, (uint64_t)cell->seqno, *ls_copy,
-                   subq->kbase.emitted_jobs, subq->kbase.insert, extract,
-                   active, cell->error);
+                   subq->kbase.emitted_jobs, *mark_pre_call, *mark_post_call,
+                   *mark_post_wait, subq->kbase.insert, extract, active,
+                   cell->error);
 
          return vk_queue_set_lost(&queue->vk,
                                   "kbase: timeout on subqueue %u", subqueue);
