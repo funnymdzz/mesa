@@ -529,25 +529,18 @@ static VkResult
 get_device_sync_types_kbase(struct panvk_physical_device *device,
                              UNUSED const struct panvk_instance *instance)
 {
-   const unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
    uint32_t sync_type_count = 0;
 
    device->drm_syncobj_type = kbase_cpu_sync_type;
 
-   if (arch >= 10) {
-      /* CSF queues require a timeline sync in sync_types[0].  Wrap the
-       * CPU binary sync in a software timeline emulation. */
-      device->sync_timeline_type =
-         vk_sync_timeline_get_type(&device->drm_syncobj_type);
-      device->sync_types[sync_type_count++] = &device->sync_timeline_type.sync;
-   } else {
-      /* JM (arch < 10): binary sync primary, software timeline secondary. */
-      device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
+   /* Binary CPU sync first (fences need a binary type with CPU_RESET),
+    * software timeline emulation second (timeline semaphores).  The
+    * kbase submission model resolves all of these on the CPU. */
+   device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
 
-      device->sync_timeline_type =
-         vk_sync_timeline_get_type(&device->drm_syncobj_type);
-      device->sync_types[sync_type_count++] = &device->sync_timeline_type.sync;
-   }
+   device->sync_timeline_type =
+      vk_sync_timeline_get_type(&device->drm_syncobj_type);
+   device->sync_types[sync_type_count++] = &device->sync_timeline_type.sync;
 
    assert(sync_type_count < ARRAY_SIZE(device->sync_types));
    device->sync_types[sync_type_count] = NULL;
