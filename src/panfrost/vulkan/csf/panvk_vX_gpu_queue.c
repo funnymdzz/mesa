@@ -68,6 +68,7 @@
 #define KBASE_SEQNO_MARK_PRE_CALL  0x100000000000ull
 #define KBASE_SEQNO_MARK_POST_CALL 0x200000000000ull
 #define KBASE_SEQNO_MARK_POST_WAIT 0x300000000000ull
+#define KBASE_CACHELINE_SIZE 64
 
 static bool
 gpu_queue_uses_kbase(const struct panvk_device *dev)
@@ -93,6 +94,40 @@ kbase_gpu_wmb(void)
 #else
    __sync_synchronize();
 #endif
+}
+
+static inline void
+kbase_cache_clean_range(const void *start, size_t size)
+{
+#if defined(__aarch64__)
+   uintptr_t ptr = (uintptr_t)start & ~(uintptr_t)(KBASE_CACHELINE_SIZE - 1);
+   uintptr_t end = ALIGN_POT((uintptr_t)start + size, KBASE_CACHELINE_SIZE);
+
+   for (; ptr < end; ptr += KBASE_CACHELINE_SIZE)
+      __asm__ volatile("dc cvac, %0" : : "r"(ptr) : "memory");
+#else
+   (void)start;
+   (void)size;
+#endif
+
+   kbase_gpu_wmb();
+}
+
+static inline void
+kbase_cache_invalidate_range(const void *start, size_t size)
+{
+#if defined(__aarch64__)
+   uintptr_t ptr = (uintptr_t)start & ~(uintptr_t)(KBASE_CACHELINE_SIZE - 1);
+   uintptr_t end = ALIGN_POT((uintptr_t)start + size, KBASE_CACHELINE_SIZE);
+
+   for (; ptr < end; ptr += KBASE_CACHELINE_SIZE)
+      __asm__ volatile("dc civac, %0" : : "r"(ptr) : "memory");
+#else
+   (void)start;
+   (void)size;
+#endif
+
+   kbase_gpu_wmb();
 }
 
 static uint32_t
@@ -156,6 +191,7 @@ kbase_init_seqnos(struct panvk_gpu_queue *queue)
 
    queue->kbase_seqnos.dev = op.va.start;
    memset(queue->kbase_seqnos.cpu, 0, 4096);
+   kbase_cache_clean_range(queue->kbase_seqnos.cpu, 4096);
    return VK_SUCCESS;
 }
 
@@ -181,6 +217,8 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    if (offset + KBASE_RING_JOB_MAX_SIZE > KBASE_RINGBUF_SIZE) {
       memset((uint8_t *)subq->kbase.ringbuf_cpu + offset, 0,
              KBASE_RINGBUF_SIZE - offset);
+      kbase_cache_clean_range((uint8_t *)subq->kbase.ringbuf_cpu + offset,
+                              KBASE_RINGBUF_SIZE - offset);
       subq->kbase.insert += KBASE_RINGBUF_SIZE - offset;
       offset = 0;
    }
@@ -295,9 +333,12 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
              padded_size - entry_size);
    }
 
-   /* Drain this entry to GPU-visible memory now, so it is in place before
-    * kbase_subqueue_publish() moves the insert offset and kicks. */
-   kbase_gpu_wmb();
+   /* kbase queue rings follow the proprietary userspace model: CPU-written
+    * ring cachelines must be explicitly cleaned before the firmware is
+    * notified through USER_IO, even when the BO is not advertised as a Mesa
+    * WB mapping. */
+   kbase_cache_clean_range((uint8_t *)subq->kbase.ringbuf_cpu + offset,
+                           padded_size);
 
    subq->kbase.insert += padded_size;
    subq->kbase.emitted_jobs++;
@@ -311,6 +352,7 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
+   uint8_t *doorbell_page = (uint8_t *)subq->kbase.user_io;
    uint8_t *input_page = (uint8_t *)subq->kbase.user_io + 4096;
 
    /* Drain the ring writes all the way to GPU-visible memory before the
@@ -322,6 +364,9 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
       subq->kbase.insert;
 
    /* And make the new insert offset itself visible before the kick. */
+   kbase_gpu_wmb();
+
+   *(volatile uint32_t *)doorbell_page = 1;
    kbase_gpu_wmb();
 
    kbase_kmod_csf_queue_kick(dev->kmod.dev, subq->kbase.ringbuf_dev);
@@ -351,8 +396,12 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
 
    /* Completion is signaled through both a SYNC_ADD64 (cell->seqno) and a
     * plain LS store (ls_copy); accept whichever lands first. */
-   while (cell->seqno < subq->kbase.emitted_jobs &&
-          *ls_copy < subq->kbase.emitted_jobs) {
+   while (true) {
+      kbase_cache_invalidate_range((const void *)cell, kbase_seqno_stride());
+      if (cell->seqno >= subq->kbase.emitted_jobs ||
+          *ls_copy >= subq->kbase.emitted_jobs)
+         break;
+
       if (cell->error) {
          mesa_loge("kbase: CS error 0x%x on subqueue %u", cell->error,
                    subqueue);
