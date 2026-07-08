@@ -77,7 +77,35 @@ gpu_queue_uses_kbase(const struct panvk_device *dev)
           '\0';
 }
 
-static uint32_t get_resource_mask(enum panvk_subqueue_id subqueue);
+static enum panvk_subqueue_id
+kbase_subqueue_from_csi(uint32_t csi)
+{
+   switch (csi) {
+   case 0:
+      return PANVK_SUBQUEUE_COMPUTE;
+   case 1:
+      return PANVK_SUBQUEUE_FRAGMENT;
+   case 2:
+      return PANVK_SUBQUEUE_VERTEX_TILER;
+   default:
+      UNREACHABLE("Unknown kbase CSI");
+   }
+}
+
+static uint32_t
+kbase_resource_mask(enum panvk_subqueue_id subqueue)
+{
+   switch (subqueue) {
+   case PANVK_SUBQUEUE_VERTEX_TILER:
+      return CS_COMPUTE_RES | CS_IDVS_RES | CS_TILER_RES;
+   case PANVK_SUBQUEUE_FRAGMENT:
+      return CS_COMPUTE_RES | CS_FRAG_RES;
+   case PANVK_SUBQUEUE_COMPUTE:
+      return CS_COMPUTE_RES;
+   default:
+      UNREACHABLE("Unknown subqueue");
+   }
+}
 
 /* Barrier that drains CPU (write-combine) stores all the way to the point
  * of coherency shared with the GPU before the doorbell/kick is observed.
@@ -242,7 +270,7 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
     * declared in the queue ring itself before ordinary commands are run.
     * The panthor kernel path owns that scheduling contract internally, but on
     * kbase our flush+CALL wrapper is the first firmware-visible work item. */
-   cs_req_res(&b, get_resource_mask(subqueue));
+   cs_req_res(&b, kbase_resource_mask(subqueue));
 
    /* The ring sequence may only clobber the FW-unpreserved registers (the
     * top 4), but cs_builder_init() reserves at least 3 registers for its
@@ -462,7 +490,8 @@ kbase_destroy_group(struct panvk_gpu_queue *queue)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
 
-   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+   for (uint32_t csi = 0; csi < PANVK_SUBQUEUE_COUNT; csi++) {
+      enum panvk_subqueue_id i = kbase_subqueue_from_csi(csi);
       struct panvk_subqueue *subq = &queue->subqueues[i];
 
       if (subq->kbase.user_io)
@@ -494,7 +523,8 @@ kbase_create_group(struct panvk_gpu_queue *queue)
 
    queue->group_handle = group_handle;
 
-   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+   for (uint32_t csi = 0; csi < PANVK_SUBQUEUE_COUNT; csi++) {
+      enum panvk_subqueue_id i = kbase_subqueue_from_csi(csi);
       struct panvk_subqueue *subq = &queue->subqueues[i];
 
       subq->kbase.ringbuf_bo =
@@ -535,7 +565,7 @@ kbase_create_group(struct panvk_gpu_queue *queue)
       subq->kbase.ringbuf_dev = op.va.start;
 
       subq->kbase.user_io = kbase_kmod_csf_queue_bind(
-         dev->kmod.dev, queue->group_handle, i, subq->kbase.ringbuf_dev,
+         dev->kmod.dev, queue->group_handle, csi, subq->kbase.ringbuf_dev,
          KBASE_RINGBUF_SIZE);
       if (!subq->kbase.user_io) {
          result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
@@ -545,6 +575,10 @@ kbase_create_group(struct panvk_gpu_queue *queue)
 
       subq->kbase.insert = 0;
       subq->kbase.emitted_jobs = 0;
+      mesa_logd("kbase: bound subqueue %u to CSI %u, ring CPU %p, "
+                "ring VA 0x%" PRIx64 ", user_io %p",
+                i, csi, subq->kbase.ringbuf_cpu, subq->kbase.ringbuf_dev,
+                subq->kbase.user_io);
    }
 
    return VK_SUCCESS;
