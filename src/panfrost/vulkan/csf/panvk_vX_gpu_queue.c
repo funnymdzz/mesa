@@ -58,7 +58,7 @@
 /* Worst-case size of one ring entry, in bytes. */
 #define KBASE_RING_JOB_MAX_SIZE 256
 /* Generous timeout for the synchronous submission model. */
-#define KBASE_WAIT_TIMEOUT_NS  (60ll * 1000000000ll)
+#define KBASE_WAIT_TIMEOUT_NS  (10ll * 1000000000ll)
 
 static bool
 gpu_queue_uses_kbase(const struct panvk_device *dev)
@@ -219,23 +219,31 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
    int64_t start = os_time_get_nano();
 
    while (cell->seqno < subq->kbase.emitted_jobs) {
-      if (cell->error)
+      if (cell->error) {
+         mesa_loge("kbase: CS error 0x%x on subqueue %u", cell->error,
+                   subqueue);
          return vk_queue_set_lost(&queue->vk,
-                                  "kbase: CS error %" PRIu64 " on subqueue %u",
-                                  (uint64_t)cell->error, subqueue);
+                                  "kbase: CS error 0x%x on subqueue %u",
+                                  cell->error, subqueue);
+      }
 
       if (os_time_get_nano() - start > KBASE_WAIT_TIMEOUT_NS) {
          const uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
          uint64_t extract = *(volatile uint64_t *)(output_page +
                                                    CS_USER_IO_OUTPUT_CS_EXTRACT);
+         uint32_t active = *(volatile uint32_t *)(output_page +
+                                                  CS_USER_IO_OUTPUT_CS_ACTIVE);
+
+         /* Log directly: on queue-init failures the vk_queue_set_lost
+          * message never reaches the user. */
+         mesa_loge("kbase: timeout on subqueue %u: seqno %" PRIu64
+                   "/%" PRIu64 ", insert %" PRIu64 ", extract %" PRIu64
+                   ", active %u, error 0x%x",
+                   subqueue, (uint64_t)cell->seqno, subq->kbase.emitted_jobs,
+                   subq->kbase.insert, extract, active, cell->error);
 
          return vk_queue_set_lost(&queue->vk,
-                                  "kbase: timeout on subqueue %u "
-                                  "(seqno %" PRIu64 "/%" PRIu64
-                                  ", insert %" PRIu64 ", extract %" PRIu64 ")",
-                                  subqueue, (uint64_t)cell->seqno,
-                                  subq->kbase.emitted_jobs, subq->kbase.insert,
-                                  extract);
+                                  "kbase: timeout on subqueue %u", subqueue);
       }
 
       usleep(100);
