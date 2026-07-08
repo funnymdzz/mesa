@@ -190,6 +190,69 @@ kbase_ring_qword(const struct panvk_subqueue *subq, uint64_t byte_offset)
    return *(volatile uint64_t *)((uint8_t *)subq->kbase.ringbuf_cpu + off);
 }
 
+static uint64_t
+kbase_stream_qword(const uint64_t *stream, uint32_t size, uint32_t qword)
+{
+   return qword * sizeof(uint64_t) < size ? stream[qword] : 0;
+}
+
+static void
+kbase_log_stream_prefix(uint32_t subqueue, uint64_t stream_addr,
+                        uint32_t stream_size, const uint64_t *stream)
+{
+   if (!stream || !stream_size)
+      return;
+
+   mesa_logd("kbase: stream subqueue %u 0x%" PRIx64 "/%u qwords[0..7] "
+             "0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+             "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64,
+             subqueue, stream_addr, stream_size,
+             kbase_stream_qword(stream, stream_size, 0),
+             kbase_stream_qword(stream, stream_size, 1),
+             kbase_stream_qword(stream, stream_size, 2),
+             kbase_stream_qword(stream, stream_size, 3),
+             kbase_stream_qword(stream, stream_size, 4),
+             kbase_stream_qword(stream, stream_size, 5),
+             kbase_stream_qword(stream, stream_size, 6),
+             kbase_stream_qword(stream, stream_size, 7));
+   mesa_logd("kbase: stream subqueue %u 0x%" PRIx64 "/%u qwords[8..15] "
+             "0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+             "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64,
+             subqueue, stream_addr, stream_size,
+             kbase_stream_qword(stream, stream_size, 8),
+             kbase_stream_qword(stream, stream_size, 9),
+             kbase_stream_qword(stream, stream_size, 10),
+             kbase_stream_qword(stream, stream_size, 11),
+             kbase_stream_qword(stream, stream_size, 12),
+             kbase_stream_qword(stream, stream_size, 13),
+             kbase_stream_qword(stream, stream_size, 14),
+             kbase_stream_qword(stream, stream_size, 15));
+   mesa_logd("kbase: stream subqueue %u 0x%" PRIx64 "/%u qwords[16..23] "
+             "0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+             "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64,
+             subqueue, stream_addr, stream_size,
+             kbase_stream_qword(stream, stream_size, 16),
+             kbase_stream_qword(stream, stream_size, 17),
+             kbase_stream_qword(stream, stream_size, 18),
+             kbase_stream_qword(stream, stream_size, 19),
+             kbase_stream_qword(stream, stream_size, 20),
+             kbase_stream_qword(stream, stream_size, 21),
+             kbase_stream_qword(stream, stream_size, 22),
+             kbase_stream_qword(stream, stream_size, 23));
+   mesa_logd("kbase: stream subqueue %u 0x%" PRIx64 "/%u qwords[24..31] "
+             "0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+             "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64,
+             subqueue, stream_addr, stream_size,
+             kbase_stream_qword(stream, stream_size, 24),
+             kbase_stream_qword(stream, stream_size, 25),
+             kbase_stream_qword(stream, stream_size, 26),
+             kbase_stream_qword(stream, stream_size, 27),
+             kbase_stream_qword(stream, stream_size, 28),
+             kbase_stream_qword(stream, stream_size, 29),
+             kbase_stream_qword(stream, stream_size, 30),
+             kbase_stream_qword(stream, stream_size, 31));
+}
+
 static VkResult
 kbase_init_seqnos(struct panvk_gpu_queue *queue)
 {
@@ -1931,6 +1994,14 @@ panvk_queue_submit_init_cmdbufs(struct panvk_queue_submit *submit,
          struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
          if (cs_is_empty(b))
             continue;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+         if (gpu_queue_uses_kbase(dev)) {
+            kbase_log_stream_prefix(j, cs_root_chunk_gpu_addr(b),
+                                    cs_root_chunk_size(b),
+                                    b->root_chunk.buffer.cpu);
+         }
+#endif
 
          submit->qsubmits[submit->qsubmit_count++] =
             (struct drm_panthor_queue_submit){
