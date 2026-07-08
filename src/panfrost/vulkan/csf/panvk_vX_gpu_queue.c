@@ -208,14 +208,23 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
       cs_call(&b, addr64, val32);
    }
 
-   /* Bump the subqueue seqno once all prior operations retired: an
-    * explicit WAIT on all scoreboard slots followed by a SYNC_ADD64 with
-    * an empty wait mask, matching the sequence the panthor kernel emits
-    * (the wait mask of a deferred op must not include its own signal
-    * slot, so waiting through the defer isn't an option). */
+   /* Signal completion once all prior operations retired: an explicit
+    * WAIT on all scoreboard slots, then a plain LS store of the absolute
+    * seqno (offset 16 in the cell), then a SYNC_ADD64 on the cell proper
+    * with an empty wait mask — the latter matching the sequence the
+    * panthor kernel emits (a deferred op's wait mask must not include its
+    * own signal slot, so waiting through the defer isn't an option).
+    * The LS store both provides a second CPU-visible completion path and
+    * lets the wait loop tell "ran but sync write lost" apart from
+    * "never ran".  Nothing is emitted after the SYNC_ADD64 (except the
+    * register-less ERROR_BARRIER) so its operands can't be clobbered
+    * while the deferred op is in flight. */
    cs_move64_to(&b, addr64, kbase_subqueue_seqno_dev_addr(queue, subqueue));
-   cs_move64_to(&b, val64, 1);
+   cs_move64_to(&b, val64, subq->kbase.emitted_jobs + 1);
    cs_wait_slots(&b, dev->csf.sb.all_mask);
+   cs_store64(&b, val64, addr64, 16);
+   cs_wait_slot(&b, SB_ID(LS));
+   cs_move64_to(&b, val64, 1);
    cs_sync64_add(&b, true, MALI_CS_SYNC_SCOPE_SYSTEM, val64, addr64,
                  cs_defer(0, SB_ID(DEFERRED_SYNC)));
 
@@ -268,12 +277,19 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
 static VkResult
 kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
 {
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
    volatile struct panvk_cs_sync64 *cell =
       kbase_subqueue_seqno_cell(queue, subqueue);
+   volatile uint64_t *ls_copy =
+      (volatile uint64_t *)((volatile uint8_t *)cell + 16);
    int64_t start = os_time_get_nano();
+   int64_t last_kick = start;
 
-   while (cell->seqno < subq->kbase.emitted_jobs) {
+   /* Completion is signaled through both a SYNC_ADD64 (cell->seqno) and a
+    * plain LS store (ls_copy); accept whichever lands first. */
+   while (cell->seqno < subq->kbase.emitted_jobs &&
+          *ls_copy < subq->kbase.emitted_jobs) {
       if (cell->error) {
          mesa_loge("kbase: CS error 0x%x on subqueue %u", cell->error,
                    subqueue);
@@ -282,7 +298,16 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
                                   cell->error, subqueue);
       }
 
-      if (os_time_get_nano() - start > KBASE_WAIT_TIMEOUT_NS) {
+      int64_t now = os_time_get_nano();
+
+      /* Re-kick periodically: a kick can race with an in-flight group
+       * suspend and get dropped. */
+      if (now - last_kick > 500ll * 1000000ll) {
+         kbase_kmod_csf_queue_kick(dev->kmod.dev, subq->kbase.ringbuf_dev);
+         last_kick = now;
+      }
+
+      if (now - start > KBASE_WAIT_TIMEOUT_NS) {
          const uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
          uint64_t extract = *(volatile uint64_t *)(output_page +
                                                    CS_USER_IO_OUTPUT_CS_EXTRACT);
@@ -292,10 +317,12 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue)
          /* Log directly: on queue-init failures the vk_queue_set_lost
           * message never reaches the user. */
          mesa_loge("kbase: timeout on subqueue %u: seqno %" PRIu64
-                   "/%" PRIu64 ", insert %" PRIu64 ", extract %" PRIu64
+                   ", ls_copy %" PRIu64 ", target %" PRIu64
+                   ", insert %" PRIu64 ", extract %" PRIu64
                    ", active %u, error 0x%x",
-                   subqueue, (uint64_t)cell->seqno, subq->kbase.emitted_jobs,
-                   subq->kbase.insert, extract, active, cell->error);
+                   subqueue, (uint64_t)cell->seqno, *ls_copy,
+                   subq->kbase.emitted_jobs, subq->kbase.insert, extract,
+                   active, cell->error);
 
          return vk_queue_set_lost(&queue->vk,
                                   "kbase: timeout on subqueue %u", subqueue);
