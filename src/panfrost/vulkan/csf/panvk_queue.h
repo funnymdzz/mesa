@@ -83,6 +83,12 @@ struct panvk_subqueue {
       /* Number of jobs emitted; each bumps the subqueue seqno cell by one
        * when it retires. */
       uint64_t emitted_jobs;
+
+      struct panvk_priv_mem init_cs;
+      uint64_t init_stream_addr;
+      uint32_t init_stream_size;
+      uint32_t init_flush_id;
+      uint32_t init_pending;
    } kbase;
 #endif
 };

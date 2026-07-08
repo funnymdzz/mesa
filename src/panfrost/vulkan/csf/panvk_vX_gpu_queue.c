@@ -835,6 +835,46 @@ finish_subqueue_tracing(struct panvk_gpu_queue *queue,
    vk_free(&dev->vk.alloc, subq->reg_file);
 }
 
+#ifdef HAVE_PAN_KMOD_KBASE
+static VkResult
+kbase_submit_init_subqueues(struct panvk_gpu_queue *queue)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   uint32_t touched = 0;
+
+   for (uint32_t csi = 0; csi < PANVK_SUBQUEUE_COUNT; csi++) {
+      enum panvk_subqueue_id subqueue = kbase_subqueue_from_csi(csi);
+      struct panvk_subqueue *subq = &queue->subqueues[subqueue];
+
+      if (!subq->kbase.init_pending)
+         continue;
+
+      VkResult res =
+         kbase_subqueue_emit_job(queue, subqueue, subq->kbase.init_stream_addr,
+                                 subq->kbase.init_stream_size,
+                                 subq->kbase.init_flush_id);
+      if (res != VK_SUCCESS)
+         return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
+                             "Failed to initialize subqueue");
+
+      touched |= BITFIELD_BIT(subqueue);
+      subq->kbase.init_pending = 0;
+   }
+
+   u_foreach_bit(i, touched)
+      kbase_subqueue_publish(queue, i);
+
+   u_foreach_bit(i, touched) {
+      VkResult res = kbase_subqueue_wait_idle(queue, i);
+      if (res != VK_SUCCESS)
+         return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
+                             "Failed to initialize subqueue");
+   }
+
+   return VK_SUCCESS;
+}
+#endif
+
 static VkResult
 init_subqueue_tracing(struct panvk_gpu_queue *queue,
                       enum panvk_subqueue_id subqueue)
@@ -922,6 +962,9 @@ finish_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
    panvk_pool_free_mem(&queue->subqueues[subqueue].context);
    panvk_pool_free_mem(&queue->subqueues[subqueue].req_resource.buf);
    panvk_pool_free_mem(&queue->subqueues[subqueue].regs_save);
+#ifdef HAVE_PAN_KMOD_KBASE
+   panvk_pool_free_mem(&queue->subqueues[subqueue].kbase.init_cs);
+#endif
    finish_subqueue_tracing(queue, subqueue);
 }
 
@@ -1094,11 +1137,29 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
    }
 
    /* We use the geometry buffer for our temporary CS buffer. */
-   root_cs = (struct cs_buffer){
-      .cpu = panvk_priv_mem_host_addr(queue->tiler_heap.desc) + 4096,
-      .gpu = panvk_priv_mem_dev_addr(queue->tiler_heap.desc) + 4096,
-      .capacity = 64 * 1024 / sizeof(uint64_t),
-   };
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev)) {
+      alloc_info.size = 4096;
+      alloc_info.alignment = 64;
+      subq->kbase.init_cs = panvk_pool_alloc_mem(mempool, alloc_info);
+      if (!panvk_priv_mem_check_alloc(subq->kbase.init_cs))
+         return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Failed to create a kbase queue init CS buffer");
+
+      root_cs = (struct cs_buffer){
+         .cpu = panvk_priv_mem_host_addr(subq->kbase.init_cs),
+         .gpu = panvk_priv_mem_dev_addr(subq->kbase.init_cs),
+         .capacity = 4096 / sizeof(uint64_t),
+      };
+   } else
+#endif
+   {
+      root_cs = (struct cs_buffer){
+         .cpu = panvk_priv_mem_host_addr(queue->tiler_heap.desc) + 4096,
+         .gpu = panvk_priv_mem_dev_addr(queue->tiler_heap.desc) + 4096,
+         .capacity = 64 * 1024 / sizeof(uint64_t),
+      };
+   }
    conf = (struct cs_builder_conf){
       .nr_registers = csif_info->cs_reg_count,
       .nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4),
@@ -1145,7 +1206,16 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
 
    assert(cs_is_valid(&b));
 
-   panvk_priv_mem_flush(queue->tiler_heap.desc, 4096, cs_root_chunk_size(&b));
+   uint32_t init_stream_size = cs_root_chunk_size(&b);
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev)) {
+      panvk_priv_mem_flush(subq->kbase.init_cs, 0, init_stream_size);
+      kbase_cache_clean_range(root_cs.cpu, init_stream_size);
+   } else
+#endif
+   {
+      panvk_priv_mem_flush(queue->tiler_heap.desc, 4096, init_stream_size);
+   }
 
    struct drm_panthor_sync_op syncop = {
       .flags =
@@ -1171,16 +1241,10 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
 
 #ifdef HAVE_PAN_KMOD_KBASE
    if (gpu_queue_uses_kbase(dev)) {
-      VkResult res =
-         kbase_subqueue_emit_job(queue, subqueue, qsubmit.stream_addr,
-                                 qsubmit.stream_size, qsubmit.latest_flush);
-      if (res == VK_SUCCESS) {
-         kbase_subqueue_publish(queue, subqueue);
-         res = kbase_subqueue_wait_idle(queue, subqueue);
-      }
-      if (res != VK_SUCCESS)
-         return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
-                             "Failed to initialize subqueue");
+      subq->kbase.init_stream_addr = qsubmit.stream_addr;
+      subq->kbase.init_stream_size = qsubmit.stream_size;
+      subq->kbase.init_flush_id = qsubmit.latest_flush;
+      subq->kbase.init_pending = 1;
    } else
 #endif
    {
@@ -1268,6 +1332,14 @@ init_queue(struct panvk_gpu_queue *queue)
       if (result != VK_SUCCESS)
          goto err_cleanup_queue;
    }
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev)) {
+      result = kbase_submit_init_subqueues(queue);
+      if (result != VK_SUCCESS)
+         goto err_cleanup_queue;
+   }
+#endif
 
    if (PANVK_DEBUG(TRACE))
       pandecode_next_frame(dev->debug.decode_ctx);
