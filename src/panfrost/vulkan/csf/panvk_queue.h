@@ -109,8 +109,14 @@ struct panvk_gpu_queue {
 
 #ifdef HAVE_PAN_KMOD_KBASE
    /* Per-subqueue completion seqno cells (panvk_cs_sync64 layout), bumped
-    * by a SYNC_ADD64 at the end of every ring entry and polled by the CPU. */
-   struct panvk_priv_mem kbase_seqnos;
+    * by a SYNC_ADD64 at the end of every ring entry and polled by the CPU.
+    * Must live in GPU-uncached memory: on inner-shareable pages the sync
+    * write can linger in the GPU L2 where the CPU never sees it. */
+   struct {
+      struct pan_kmod_bo *bo;
+      void *cpu;
+      uint64_t dev;
+   } kbase_seqnos;
 #endif
 
    struct {

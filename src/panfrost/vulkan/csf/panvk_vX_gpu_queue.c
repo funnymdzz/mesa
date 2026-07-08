@@ -76,7 +76,7 @@ kbase_seqno_stride(void)
 static volatile struct panvk_cs_sync64 *
 kbase_subqueue_seqno_cell(struct panvk_gpu_queue *queue, uint32_t subqueue)
 {
-   uint8_t *base = panvk_priv_mem_host_addr(queue->kbase_seqnos);
+   uint8_t *base = queue->kbase_seqnos.cpu;
 
    return (volatile struct panvk_cs_sync64 *)(base +
                                               subqueue *
@@ -86,8 +86,49 @@ kbase_subqueue_seqno_cell(struct panvk_gpu_queue *queue, uint32_t subqueue)
 static uint64_t
 kbase_subqueue_seqno_dev_addr(struct panvk_gpu_queue *queue, uint32_t subqueue)
 {
-   return panvk_priv_mem_dev_addr(queue->kbase_seqnos) +
-          subqueue * kbase_seqno_stride();
+   return queue->kbase_seqnos.dev + subqueue * kbase_seqno_stride();
+}
+
+static VkResult
+kbase_init_seqnos(struct panvk_gpu_queue *queue)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+
+   /* GPU-uncached so the SYNC_ADD64 lands straight in memory where the
+    * CPU poll can see it, instead of lingering in the GPU L2. */
+   queue->kbase_seqnos.bo =
+      pan_kmod_bo_alloc(dev->kmod.dev, dev->kmod.vm, 4096,
+                        PAN_KMOD_BO_FLAG_GPU_UNCACHED);
+   if (!queue->kbase_seqnos.bo)
+      return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "Failed to allocate kbase seqno cells");
+
+   queue->kbase_seqnos.cpu = pan_kmod_bo_mmap(
+      queue->kbase_seqnos.bo, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+   if (queue->kbase_seqnos.cpu == MAP_FAILED) {
+      queue->kbase_seqnos.cpu = NULL;
+      return panvk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
+                          "Failed to map kbase seqno cells");
+   }
+
+   struct pan_kmod_vm_op op = {
+      .type = PAN_KMOD_VM_OP_TYPE_MAP,
+      .va = {
+         .start = PAN_KMOD_VM_MAP_AUTO_VA,
+         .size = 4096,
+      },
+      .map = {
+         .bo = queue->kbase_seqnos.bo,
+         .bo_offset = 0,
+      },
+   };
+   if (pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &op, 1))
+      return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "Failed to GPU map kbase seqno cells");
+
+   queue->kbase_seqnos.dev = op.va.start;
+   memset(queue->kbase_seqnos.cpu, 0, 4096);
+   return VK_SUCCESS;
 }
 
 /* Emit one job into the subqueue ring: cache maintenance, a CALL to the
@@ -1000,7 +1041,8 @@ cleanup_queue(struct panvk_gpu_queue *queue)
 
    panvk_pool_free_mem(&queue->syncobjs);
 #ifdef HAVE_PAN_KMOD_KBASE
-   panvk_pool_free_mem(&queue->kbase_seqnos);
+   pan_kmod_bo_put(queue->kbase_seqnos.bo);
+   queue->kbase_seqnos.bo = NULL;
 #endif
 }
 
@@ -1023,13 +1065,9 @@ init_queue(struct panvk_gpu_queue *queue)
 
 #ifdef HAVE_PAN_KMOD_KBASE
    if (gpu_queue_uses_kbase(dev)) {
-      queue->kbase_seqnos = panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
-      if (!panvk_priv_mem_check_alloc(queue->kbase_seqnos))
-         return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                             "Failed to allocate kbase seqno cells");
-
-      memset(panvk_priv_mem_host_addr(queue->kbase_seqnos), 0,
-             alloc_info.size);
+      result = kbase_init_seqnos(queue);
+      if (result != VK_SUCCESS)
+         return result;
    }
 #endif
 
