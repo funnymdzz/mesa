@@ -196,6 +196,12 @@ kbase_stream_qword(const uint64_t *stream, uint32_t size, uint32_t qword)
    return qword * sizeof(uint64_t) < size ? stream[qword] : 0;
 }
 
+static uint8_t
+kbase_stream_opcode(const uint64_t *stream, uint32_t size, uint32_t qword)
+{
+   return kbase_stream_qword(stream, size, qword) >> 56;
+}
+
 static void
 kbase_log_stream_prefix(uint32_t subqueue, uint64_t stream_addr,
                         uint32_t stream_size, const uint64_t *stream)
@@ -203,54 +209,30 @@ kbase_log_stream_prefix(uint32_t subqueue, uint64_t stream_addr,
    if (!stream || !stream_size)
       return;
 
-   mesa_logd("kbase: stream subqueue %u 0x%" PRIx64 "/%u qwords[0..7] "
-             "0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
-             "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64,
-             subqueue, stream_addr, stream_size,
-             kbase_stream_qword(stream, stream_size, 0),
-             kbase_stream_qword(stream, stream_size, 1),
-             kbase_stream_qword(stream, stream_size, 2),
-             kbase_stream_qword(stream, stream_size, 3),
-             kbase_stream_qword(stream, stream_size, 4),
-             kbase_stream_qword(stream, stream_size, 5),
-             kbase_stream_qword(stream, stream_size, 6),
-             kbase_stream_qword(stream, stream_size, 7));
-   mesa_logd("kbase: stream subqueue %u 0x%" PRIx64 "/%u qwords[8..15] "
-             "0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
-             "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64,
-             subqueue, stream_addr, stream_size,
-             kbase_stream_qword(stream, stream_size, 8),
-             kbase_stream_qword(stream, stream_size, 9),
-             kbase_stream_qword(stream, stream_size, 10),
-             kbase_stream_qword(stream, stream_size, 11),
-             kbase_stream_qword(stream, stream_size, 12),
-             kbase_stream_qword(stream, stream_size, 13),
-             kbase_stream_qword(stream, stream_size, 14),
-             kbase_stream_qword(stream, stream_size, 15));
-   mesa_logd("kbase: stream subqueue %u 0x%" PRIx64 "/%u qwords[16..23] "
-             "0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
-             "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64,
-             subqueue, stream_addr, stream_size,
-             kbase_stream_qword(stream, stream_size, 16),
-             kbase_stream_qword(stream, stream_size, 17),
-             kbase_stream_qword(stream, stream_size, 18),
-             kbase_stream_qword(stream, stream_size, 19),
-             kbase_stream_qword(stream, stream_size, 20),
-             kbase_stream_qword(stream, stream_size, 21),
-             kbase_stream_qword(stream, stream_size, 22),
-             kbase_stream_qword(stream, stream_size, 23));
-   mesa_logd("kbase: stream subqueue %u 0x%" PRIx64 "/%u qwords[24..31] "
-             "0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
-             "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64,
-             subqueue, stream_addr, stream_size,
-             kbase_stream_qword(stream, stream_size, 24),
-             kbase_stream_qword(stream, stream_size, 25),
-             kbase_stream_qword(stream, stream_size, 26),
-             kbase_stream_qword(stream, stream_size, 27),
-             kbase_stream_qword(stream, stream_size, 28),
-             kbase_stream_qword(stream, stream_size, 29),
-             kbase_stream_qword(stream, stream_size, 30),
-             kbase_stream_qword(stream, stream_size, 31));
+   for (uint32_t base = 0; base < MIN2(stream_size / sizeof(uint64_t), 96u);
+        base += 8) {
+      mesa_logd("kbase: stream subqueue %u 0x%" PRIx64 "/%u qwords[%u..%u] "
+                "0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+                "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+                " ops %02x/%02x/%02x/%02x/%02x/%02x/%02x/%02x",
+                subqueue, stream_addr, stream_size, base, base + 7,
+                kbase_stream_qword(stream, stream_size, base + 0),
+                kbase_stream_qword(stream, stream_size, base + 1),
+                kbase_stream_qword(stream, stream_size, base + 2),
+                kbase_stream_qword(stream, stream_size, base + 3),
+                kbase_stream_qword(stream, stream_size, base + 4),
+                kbase_stream_qword(stream, stream_size, base + 5),
+                kbase_stream_qword(stream, stream_size, base + 6),
+                kbase_stream_qword(stream, stream_size, base + 7),
+                kbase_stream_opcode(stream, stream_size, base + 0),
+                kbase_stream_opcode(stream, stream_size, base + 1),
+                kbase_stream_opcode(stream, stream_size, base + 2),
+                kbase_stream_opcode(stream, stream_size, base + 3),
+                kbase_stream_opcode(stream, stream_size, base + 4),
+                kbase_stream_opcode(stream, stream_size, base + 5),
+                kbase_stream_opcode(stream, stream_size, base + 6),
+                kbase_stream_opcode(stream, stream_size, base + 7));
+   }
 }
 
 static VkResult
