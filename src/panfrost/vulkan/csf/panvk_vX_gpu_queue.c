@@ -77,6 +77,8 @@ gpu_queue_uses_kbase(const struct panvk_device *dev)
           '\0';
 }
 
+static uint32_t get_resource_mask(enum panvk_subqueue_id subqueue);
+
 /* Barrier that drains CPU (write-combine) stores all the way to the point
  * of coherency shared with the GPU before the doorbell/kick is observed.
  * The Mali GPU sits in the outer/system shareability domain, so the inner-
