@@ -236,6 +236,12 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
 
    cs_builder_init(&b, &conf, ring_buf);
 
+   /* kbase userspace-owned queues need their resource requirements to be
+    * declared in the queue ring itself before ordinary commands are run.
+    * The panthor kernel path owns that scheduling contract internally, but on
+    * kbase our flush+CALL wrapper is the first firmware-visible work item. */
+   cs_req_res(&b, get_resource_mask(subqueue));
+
    /* The ring sequence may only clobber the FW-unpreserved registers (the
     * top 4), but cs_builder_init() reserves at least 3 registers for its
     * own chunk linking — which our fixed-size ring entries never trigger —
