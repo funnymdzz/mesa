@@ -169,6 +169,20 @@ kbase_clean_priv_mem(struct panvk_priv_mem mem, uint64_t offset, size_t size)
       kbase_cache_clean_range((uint8_t *)cpu + offset, size);
 }
 
+static void
+kbase_clean_pool(struct panvk_pool *pool)
+{
+   list_for_each_entry(struct panvk_priv_bo, bo, &pool->bos, node) {
+      if (bo->addr.host)
+         kbase_cache_clean_range(bo->addr.host, pan_kmod_bo_size(bo->bo));
+   }
+
+   list_for_each_entry(struct panvk_priv_bo, bo, &pool->big_bos, node) {
+      if (bo->addr.host)
+         kbase_cache_clean_range(bo->addr.host, pan_kmod_bo_size(bo->bo));
+   }
+}
+
 static uint32_t
 kbase_seqno_stride(void)
 {
@@ -2116,6 +2130,13 @@ panvk_queue_submit_init_cmdbufs(struct panvk_queue_submit *submit,
    for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++) {
       struct panvk_cmd_buffer *cmdbuf = container_of(
          vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+
+#ifdef HAVE_PAN_KMOD_KBASE
+      if (gpu_queue_uses_kbase(dev)) {
+         kbase_clean_pool(&cmdbuf->cs_pool);
+         kbase_clean_pool(&cmdbuf->desc_pool);
+      }
+#endif
 
       uint32_t flush_id = panvk_get_flush_id(dev);
 
