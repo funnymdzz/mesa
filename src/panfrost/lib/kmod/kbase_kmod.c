@@ -295,10 +295,16 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
    }
 
    /* Coherency: kbase raw coherency mode.
-    * 0 = none, 1 = ACE-Lite, 2 = ACE. */
+    * 0 = none, 1 = ACE-Lite, 2 = ACE.
+    *
+    * In pan_kmod, is_io_coherent means explicit CPU cache maintenance can be
+    * skipped for WB_MMAP BOs. That is not true for this kbase backend: kbase
+    * cached CPU mappings still need KBASE_IOCTL_MEM_SYNC before GPU access and
+    * after GPU writes.
+    */
    uint32_t coherency_mode = (uint32_t)kbase_gpuprop_get(
       buf, buf_size, KBASE_GPUPROP_RAW_COHERENCY_MODE, 0);
-   props->is_io_coherent = coherency_mode != 0;
+   props->is_io_coherent = false;
 
    /* Timestamp: expose if gpu_id is non-zero (safe assumption). */
    props->gpu_can_query_timestamp = (props->gpu_id != 0);
@@ -316,12 +322,13 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
       PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM |
       PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW;
 
-   /* Supported BO flags — WB_MMAP requires cache-sync support
-    * (KBASE_IOCTL_MEM_SYNC / BASE_MEM_CACHED_CPU) which we leave for
-    * future work; skip it for now so flush_bo_map_syncs is a no-op. */
+   /* Supported BO flags. WB_MMAP is backed by BASE_MEM_CACHED_CPU and explicit
+    * KBASE_IOCTL_MEM_SYNC operations in kbase_kmod_flush_bo_map_syncs().
+    */
    props->supported_bo_flags = PAN_KMOD_BO_FLAG_EXECUTABLE |
                                 PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
                                 PAN_KMOD_BO_FLAG_NO_MMAP |
+                                PAN_KMOD_BO_FLAG_WB_MMAP |
                                 PAN_KMOD_BO_FLAG_GPU_UNCACHED;
 }
 
@@ -791,6 +798,8 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
       .version = { .major = ver.major, .minor = ver.minor },
    };
 
+   flags |= PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL;
+
    pan_kmod_dev_init(&kbase_dev->base, fd, flags, &kbase_drv,
                      &kbase_kmod_ops, allocator);
 
@@ -912,15 +921,14 @@ to_kbase_mem_flags(uint32_t kmod_flags)
    if (kmod_flags & PAN_KMOD_BO_FLAG_GPU_UNCACHED)
       flags |= BASE_MEM_UNCACHED_GPU;
 
+   if (kmod_flags & PAN_KMOD_BO_FLAG_WB_MMAP)
+      flags |= BASE_MEM_CACHED_CPU;
+
    if (kmod_flags & PAN_KMOD_BO_FLAG_IO_COHERENT)
       flags |= BASE_MEM_COHERENT_SYSTEM;
 
    if (kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT)
       flags |= BASE_MEM_GROW_ON_GPF;
-
-   /* Note: no BASE_MEM_CACHED_CPU — CPU mappings are write-combine until
-    * cache maintenance (KBASE_IOCTL_MEM_SYNC) is wired up, which keeps
-    * things coherent without any flush support. */
 
    return flags;
 }
@@ -1102,11 +1110,29 @@ kbase_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
    return true;
 }
 
-/* WB_MMAP is not advertised in supported_bo_flags so this path should never
- * be reached in practice.  Return success to avoid assertion failures. */
 static int
 kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
 {
+   util_dynarray_foreach(&dev->pending_bo_syncs.array,
+                         struct pan_kmod_deferred_bo_sync, sync) {
+      struct kbase_kmod_bo *kbase_bo =
+         container_of(sync->bo, struct kbase_kmod_bo, base);
+
+      struct kbase_ioctl_mem_sync req = {
+         .handle = kbase_bo->gpu_va,
+         .user_addr = (uintptr_t)kbase_bo->cpu_ptr + sync->start,
+         .size = sync->size,
+         .type = sync->type == PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH
+                    ? BASE_SYNCSET_OP_MSYNC
+                    : BASE_SYNCSET_OP_CSYNC,
+      };
+
+      if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_SYNC, &req)) {
+         mesa_loge("kbase: KBASE_IOCTL_MEM_SYNC failed: %s", strerror(errno));
+         return -1;
+      }
+   }
+
    return 0;
 }
 
