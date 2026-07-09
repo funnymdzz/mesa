@@ -55,6 +55,7 @@ int kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
                                      uint32_t initial_chunks,
                                      uint32_t max_chunks,
                                      uint32_t target_in_flight,
+                                     uint32_t group_id,
                                      uint64_t *heap_ctx_va,
                                      uint64_t *first_chunk_va);
 void kbase_kmod_csf_tiler_heap_destroy(struct pan_kmod_dev *dev,

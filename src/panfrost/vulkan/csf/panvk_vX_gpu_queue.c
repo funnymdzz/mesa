@@ -1682,7 +1682,7 @@ init_tiler(struct panvk_gpu_queue *queue)
       if (kbase_kmod_csf_tiler_heap_create(
              dev->kmod.dev, tiler_heap->chunk_size,
              phys_dev->csf.tiler.initial_chunks, phys_dev->csf.tiler.max_chunks,
-             65535, &heap_ctx_va, &first_chunk_va)) {
+             65535, queue->group_handle, &heap_ctx_va, &first_chunk_va)) {
          result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                                "Failed to create a tiler heap context");
          goto err_free_desc;
@@ -1694,10 +1694,11 @@ init_tiler(struct panvk_gpu_queue *queue)
 
       mesa_logd("kbase: tiler heap ctx 0x%" PRIx64
                 ", first chunk 0x%" PRIx64
-                ", chunk size %u, initial %u, max %u, target %u",
+                ", chunk size %u, initial %u, max %u, target %u, group %u",
                 heap_ctx_va, first_chunk_va, tiler_heap->chunk_size,
                 phys_dev->csf.tiler.initial_chunks,
-                phys_dev->csf.tiler.max_chunks, 65535);
+                phys_dev->csf.tiler.max_chunks, 65535,
+                queue->group_handle);
    } else
 #endif
    {
@@ -2504,6 +2505,8 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *dev,
 #else
    const bool uses_kbase = false;
 #endif
+   bool group_created = false;
+   bool tiler_initialized = false;
 
    if (!uses_kbase) {
       int ret = drmSyncobjCreate(dev->drm_fd, 0, &queue->syncobj_handle);
@@ -2514,42 +2517,59 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *dev,
       }
    }
 
-   result = init_tiler(queue);
-   if (result != VK_SUCCESS)
-      goto err_destroy_syncobj;
-
    const VkDeviceQueueShaderCoreControlCreateInfoARM *core_ctrl =
       vk_find_struct_const(create_info->pNext,
                            DEVICE_QUEUE_SHADER_CORE_CONTROL_CREATE_INFO_ARM);
 
 #ifdef HAVE_PAN_KMOD_KBASE
-   if (uses_kbase)
+   if (uses_kbase) {
       result = kbase_create_group(queue);
-   else
+      if (result != VK_SUCCESS)
+         goto err_destroy_syncobj;
+      group_created = true;
+
+      result = init_tiler(queue);
+      if (result != VK_SUCCESS)
+         goto err_cleanup_created;
+      tiler_initialized = true;
+   } else
 #endif
+   {
+      result = init_tiler(queue);
+      if (result != VK_SUCCESS)
+         goto err_destroy_syncobj;
+      tiler_initialized = true;
+
       result = create_group(queue, get_panthor_group_priority(create_info),
                             core_ctrl ? core_ctrl->shaderCoreCount : 0);
-   if (result != VK_SUCCESS)
-      goto err_cleanup_tiler;
+      if (result != VK_SUCCESS)
+         goto err_cleanup_created;
+      group_created = true;
+   }
 
    result = init_queue(queue);
    if (result != VK_SUCCESS)
-      goto err_destroy_group;
+      goto err_cleanup_created;
 
    queue->vk.driver_submit = panvk_per_arch(gpu_queue_submit);
    *out_queue = &queue->vk;
    return VK_SUCCESS;
 
-err_destroy_group:
+err_cleanup_created:
 #ifdef HAVE_PAN_KMOD_KBASE
-   if (uses_kbase)
-      kbase_destroy_group(queue);
-   else
+   if (uses_kbase) {
+      if (tiler_initialized)
+         cleanup_tiler(queue);
+      if (group_created)
+         kbase_destroy_group(queue);
+   } else
 #endif
-      destroy_group(queue);
-
-err_cleanup_tiler:
-   cleanup_tiler(queue);
+   {
+      if (group_created)
+         destroy_group(queue);
+      if (tiler_initialized)
+         cleanup_tiler(queue);
+   }
 
 err_destroy_syncobj:
    if (!uses_kbase)
@@ -2572,8 +2592,8 @@ panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
    cleanup_queue(queue);
 #ifdef HAVE_PAN_KMOD_KBASE
    if (gpu_queue_uses_kbase(dev)) {
-      kbase_destroy_group(queue);
       cleanup_tiler(queue);
+      kbase_destroy_group(queue);
    } else
 #endif
    {

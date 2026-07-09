@@ -566,7 +566,7 @@ int
 kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
                                  uint32_t chunk_size, uint32_t initial_chunks,
                                  uint32_t max_chunks,
-                                 uint32_t target_in_flight,
+                                 uint32_t target_in_flight, uint32_t group_id,
                                  uint64_t *heap_ctx_va,
                                  uint64_t *first_chunk_va)
 {
@@ -576,6 +576,7 @@ kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
          .initial_chunks = initial_chunks,
          .max_chunks = max_chunks,
          .target_in_flight = MIN2(target_in_flight, UINT16_MAX),
+         .group_id = group_id,
       },
    };
 
