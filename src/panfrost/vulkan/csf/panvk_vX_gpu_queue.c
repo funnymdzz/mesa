@@ -459,6 +459,14 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
     * kbase our flush+CALL wrapper is the first firmware-visible work item. */
    cs_req_res(&b, kbase_resource_mask(subqueue));
 
+   /* The PanVK command streams assume the subqueue context register is live
+    * on entry. The panthor kernel ring preserves that queue ABI for us, but
+    * kbase executes userspace-owned ring entries, so restore it at each CALL
+    * boundary instead of relying on the init stream's register state to
+    * survive separate kicks. */
+   cs_move64_to(&b, cs_subqueue_ctx_reg(&b),
+                panvk_priv_mem_dev_addr(subq->context));
+
    /* The ring sequence may only clobber the FW-unpreserved registers (the
     * top 4), but cs_builder_init() reserves at least 3 registers for its
     * own chunk linking — which our fixed-size ring entries never trigger —
