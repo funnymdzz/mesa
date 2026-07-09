@@ -406,6 +406,10 @@ union kbase_ioctl_cs_queue_group_create_1_6 {
    _IOWR(KBASE_IOCTL_TYPE, 42, union kbase_ioctl_cs_queue_group_create_1_6)
 
 /* Extended version (uAPI >= 1.18) */
+#define BASE_CSF_TILER_OOM_EXCEPTION_FLAG (1u << 0)
+#define BASE_CSF_EXCEPTION_HANDLER_FLAGS_MASK \
+   BASE_CSF_TILER_OOM_EXCEPTION_FLAG
+
 union kbase_ioctl_cs_queue_group_create {
    struct {
       __u64 tiler_mask;

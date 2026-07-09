@@ -450,6 +450,34 @@ kbase_kmod_csf_group_create(struct pan_kmod_dev *dev, uint32_t cs_queue_count,
 {
    /* Endpoint masks/maxes match what panfork uses on all CSF parts:
     * a single tiler unit, all fragment/compute endpoints. */
+   if (pan_kmod_driver_version_at_least(&dev->driver, 1, 18)) {
+      /* Pixel uAPI 1.38 extends this request past the 1.18 fields imported in
+       * this fork.  Keep a zeroed tail in case the kernel dispatches by ioctl
+       * number and copies its larger native struct. */
+      uint64_t req_storage[32] = {0};
+      union kbase_ioctl_cs_queue_group_create *req = (void *)req_storage;
+      STATIC_ASSERT(sizeof(*req) <= sizeof(req_storage));
+
+      req->in.tiler_mask = 1;
+      req->in.fragment_mask = ~0ull;
+      req->in.compute_mask = ~0ull;
+      req->in.cs_min = cs_queue_count;
+      req->in.priority = 1;
+      req->in.tiler_max = 1;
+      req->in.fragment_max = 64;
+      req->in.compute_max = 64;
+      req->in.csi_handlers = BASE_CSF_TILER_OOM_EXCEPTION_FLAG;
+
+      if (!ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, req)) {
+         *group_handle = req->out.group_handle;
+         return 0;
+      }
+
+      mesa_logw("kbase: KBASE_IOCTL_CS_QUEUE_GROUP_CREATE failed: %s; "
+                "falling back to 1.6 group create without tiler OOM handler",
+                strerror(errno));
+   }
+
    union kbase_ioctl_cs_queue_group_create_1_6 req = {
       .in = {
          .tiler_mask = 1,
