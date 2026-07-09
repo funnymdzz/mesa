@@ -279,7 +279,10 @@ panvk_per_arch(get_physical_device_features)(
    const struct panvk_instance *instance,
    const struct panvk_physical_device *device, struct vk_features *features)
 {
-   bool has_sparse = PAN_ARCH >= 10;
+   /* The kbase backend does not have a sparse bind queue implementation yet.
+    * Do not advertise sparse support there, otherwise CTS will exercise sparse
+    * binding paths that can only fail at submit time. */
+   bool has_sparse = PAN_ARCH >= 10 && !device->kbase_node_path[0];
 
    *features = (struct vk_features){
       /* Vulkan 1.0 */
@@ -749,6 +752,7 @@ panvk_per_arch(get_physical_device_properties)(
    os_get_page_size(&os_page_size);
 
    const bool has_disk_cache = device->vk.disk_cache != NULL;
+   const bool has_sparse = PAN_ARCH >= 10 && !device->kbase_node_path[0];
 
    /* Ensure that the max threads count per workgroup is valid for Bifrost */
    assert(PAN_ARCH > 8 || device->kmod.dev->props.max_threads_per_wg <= 1024);
@@ -813,7 +817,8 @@ panvk_per_arch(get_physical_device_properties)(
       .bufferImageGranularity = 64,
       /* The entire user-allocatable VA range. */
       .sparseAddressSpaceSize =
-         pan_kmod_dev_query_user_va_range(device->kmod.dev).size,
+         has_sparse ? pan_kmod_dev_query_user_va_range(device->kmod.dev).size
+                    : 0,
       .maxBoundDescriptorSets = MAX_SETS,
       .maxPerStageDescriptorSamplers = MAX_PER_STAGE_SAMPLERS,
       .maxPerStageDescriptorUniformBuffers = MAX_PER_STAGE_UNIFORM_BUFFERS,
@@ -953,7 +958,7 @@ panvk_per_arch(get_physical_device_properties)(
       /* Vulkan 1.0 sparse properties */
       .sparseResidencyNonResidentStrict = false,
       .sparseResidencyAlignedMipSize = false,
-      .sparseResidencyStandard2DBlockShape = true,
+      .sparseResidencyStandard2DBlockShape = has_sparse,
       .sparseResidencyStandard2DMultisampleBlockShape = false,
       .sparseResidencyStandard3DBlockShape = false,
 
