@@ -97,9 +97,15 @@ kbase_resource_mask(enum panvk_subqueue_id subqueue)
 {
    switch (subqueue) {
    case PANVK_SUBQUEUE_VERTEX_TILER:
-      return CS_IDVS_RES | CS_TILER_RES;
+      /* The kbase userspace queue wrapper is the residency contract seen by
+       * the proprietary scheduler/firmware.  Keep COMPUTE requested for
+       * graphics queues as well: the generated PanVK stream still advertises
+       * exact graphics resources to the panthor path, but the kbase wrapper
+       * needs the conservative CSF userspace contract for the queue to resume
+       * through async tiler/fragment work and memory-sync waits. */
+      return CS_COMPUTE_RES | CS_IDVS_RES | CS_TILER_RES;
    case PANVK_SUBQUEUE_FRAGMENT:
-      return CS_FRAG_RES;
+      return CS_COMPUTE_RES | CS_FRAG_RES;
    case PANVK_SUBQUEUE_COMPUTE:
       return CS_COMPUTE_RES;
    default:
