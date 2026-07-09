@@ -160,6 +160,15 @@ kbase_cache_invalidate_range(const void *start, size_t size)
    kbase_gpu_wmb();
 }
 
+static void
+kbase_clean_priv_mem(struct panvk_priv_mem mem, uint64_t offset, size_t size)
+{
+   void *cpu = panvk_priv_mem_host_addr(mem);
+
+   if (cpu)
+      kbase_cache_clean_range((uint8_t *)cpu + offset, size);
+}
+
 static uint32_t
 kbase_seqno_stride(void)
 {
@@ -200,6 +209,25 @@ static uint8_t
 kbase_stream_opcode(const uint64_t *stream, uint32_t size, uint32_t qword)
 {
    return kbase_stream_qword(stream, size, qword) >> 56;
+}
+
+static void
+kbase_log_queue_syncobjs(struct panvk_gpu_queue *queue)
+{
+   struct panvk_cs_sync64 *syncobjs = panvk_priv_mem_host_addr(queue->syncobjs);
+
+   if (!syncobjs)
+      return;
+
+   kbase_cache_invalidate_range(syncobjs,
+                                sizeof(*syncobjs) * PANVK_SUBQUEUE_COUNT);
+
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      struct panvk_cs_sync64 *syncobj = &syncobjs[i];
+
+      mesa_loge("kbase: queue syncobj %u: seqno %" PRIu64 ", error 0x%x",
+                i, syncobj->seqno, syncobj->error);
+   }
 }
 
 static void
@@ -685,6 +713,8 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
                    kbase_ring_qword(subq, extract_line + 48),
                    kbase_ring_qword(subq, extract_line + 56));
 
+         kbase_log_queue_syncobjs(queue);
+
          for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
             kbase_log_subqueue_state(queue, i, "timeout snapshot");
 
@@ -1003,6 +1033,11 @@ ringbuf_mapped:
          .seqno = RENDER_DESC_RINGBUF_SIZE,
       };
    }
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev))
+      kbase_clean_priv_mem(ringbuf->syncobj, 0,
+                           sizeof(struct panvk_cs_sync32));
+#endif
 
    return VK_SUCCESS;
 }
@@ -1348,6 +1383,11 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
             panvk_priv_mem_dev_addr(queue->tiler_heap.oom_fbd);
       }
    }
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev))
+      kbase_clean_priv_mem(subq->context, 0,
+                           sizeof(struct panvk_cs_subqueue_context));
+#endif
 
    /* We use the geometry buffer for our temporary CS buffer. */
 #ifdef HAVE_PAN_KMOD_KBASE
@@ -1407,6 +1447,13 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
                         struct panvk_cs_sync64, syncobj) {
       syncobj->seqno = 1;
    }
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev)) {
+      kbase_clean_priv_mem(queue->syncobjs,
+                           subqueue * sizeof(struct panvk_cs_sync64),
+                           sizeof(struct panvk_cs_sync64));
+   }
+#endif
 
    if (subqueue != PANVK_SUBQUEUE_COMPUTE) {
       struct cs_index heap_ctx_addr = cs_scratch_reg64(&b, 0);
@@ -1732,6 +1779,7 @@ init_tiler(struct panvk_gpu_queue *queue)
 
 #ifdef HAVE_PAN_KMOD_KBASE
    if (gpu_queue_uses_kbase(dev)) {
+      kbase_clean_priv_mem(tiler_heap->desc, 0, pan_size(TILER_HEAP));
       mesa_logd("kbase: tiler heap desc 0x%" PRIx64
                 ": base 0x%" PRIx64 ", bottom 0x%" PRIx64
                 ", top 0x%" PRIx64 ", geom 0x%" PRIx64
