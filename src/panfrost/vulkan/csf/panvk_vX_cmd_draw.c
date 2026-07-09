@@ -51,6 +51,38 @@
 #include "vk_render_pass.h"
 #include "poly/geometry.h"
 
+static bool
+cmd_uses_kbase(struct panvk_cmd_buffer *cmdbuf)
+{
+#ifdef HAVE_PAN_KMOD_KBASE
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+
+   return phys_dev->kbase_node_path[0] != '\0';
+#else
+   return false;
+#endif
+}
+
+static void
+kbase_mark_vt_progress(struct panvk_cmd_buffer *cmdbuf, uint32_t marker)
+{
+   if (!cmd_uses_kbase(cmdbuf))
+      return;
+
+   struct cs_builder *b =
+      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+   struct cs_index sync_addr = cs_scratch_reg64(b, 28);
+   struct cs_index val = cs_scratch_reg32(b, 30);
+
+   cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
+                offsetof(struct panvk_cs_subqueue_context, syncobjs));
+   cs_move32_to(b, val, marker);
+   cs_store32(b, val, sync_addr, offsetof(struct panvk_cs_sync64, pad));
+   cs_flush_stores(b);
+}
+
 #if PAN_ARCH < 14
 static enum cs_reg_perm
 provoking_vertex_fn_reg_perm_cb(struct cs_builder *b, unsigned reg)
@@ -2633,6 +2665,8 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
    uint32_t idvs_count = DIV_ROUND_UP(cmdbuf->state.gfx.render.layer_count,
                                       MAX_LAYERS_PER_TILER_DESC);
 
+   kbase_mark_vt_progress(cmdbuf, 0x110);
+
    panvk_cond_render(cmdbuf, b)
    {
       if (idvs_count > 1) {
@@ -2677,6 +2711,8 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
 #endif
       }
    }
+
+   kbase_mark_vt_progress(cmdbuf, 0x120);
 }
 
 VkResult
@@ -3376,7 +3412,9 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
       return;
 
    /* Flush the tiling operations and signal the internal sync object. */
+   kbase_mark_vt_progress(cmdbuf, 0x200);
    cs_finish_tiling(b);
+   kbase_mark_vt_progress(cmdbuf, 0x210);
 
    /* We're relying on PANVK_SUBQUEUE_VERTEX_TILER being the first queue to
     * skip an ADD operation on the syncobjs pointer. */
@@ -3391,9 +3429,11 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
 
    cs_move64_to(b, add_val, 1);
    cs_vt_end(b, cs_defer_indirect());
+   kbase_mark_vt_progress(cmdbuf, 0x220);
    panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, true,
                           MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
                           cs_defer_indirect());
+   kbase_mark_vt_progress(cmdbuf, 0x230);
 #else
    struct cs_index sync_addr = cs_scratch_reg64(b, 0);
    struct cs_index iter_sb = cs_scratch_reg32(b, 2);
@@ -3408,9 +3448,11 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
 
    cs_match_iter_sb(b, x, iter_sb, cmp_scratch) {
       cs_vt_end(b, cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
+      kbase_mark_vt_progress(cmdbuf, 0x220);
       panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, true,
                              MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
                              cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
+      kbase_mark_vt_progress(cmdbuf, 0x230);
    }
 #endif
 

@@ -225,8 +225,9 @@ kbase_log_queue_syncobjs(struct panvk_gpu_queue *queue)
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       struct panvk_cs_sync64 *syncobj = &syncobjs[i];
 
-      mesa_loge("kbase: queue syncobj %u: seqno %" PRIu64 ", error 0x%x",
-                i, syncobj->seqno, syncobj->error);
+      mesa_loge("kbase: queue syncobj %u: seqno %" PRIu64
+                ", error 0x%x, pad 0x%x",
+                i, syncobj->seqno, syncobj->error, syncobj->pad);
    }
 }
 
