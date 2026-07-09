@@ -97,9 +97,9 @@ kbase_resource_mask(enum panvk_subqueue_id subqueue)
 {
    switch (subqueue) {
    case PANVK_SUBQUEUE_VERTEX_TILER:
-      return CS_COMPUTE_RES | CS_IDVS_RES | CS_TILER_RES;
+      return CS_IDVS_RES | CS_TILER_RES;
    case PANVK_SUBQUEUE_FRAGMENT:
-      return CS_COMPUTE_RES | CS_FRAG_RES;
+      return CS_FRAG_RES;
    case PANVK_SUBQUEUE_COMPUTE:
       return CS_COMPUTE_RES;
    default:
