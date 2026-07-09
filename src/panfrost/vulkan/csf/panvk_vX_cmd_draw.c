@@ -71,10 +71,17 @@ kbase_mark_vt_progress(struct panvk_cmd_buffer *cmdbuf, uint32_t marker)
    if (!cmd_uses_kbase(cmdbuf))
       return;
 
+   enum {
+      KBASE_MARK_ADDR_REG = 14,
+      KBASE_MARK_VALUE_REG = 16,
+   };
+   STATIC_ASSERT(KBASE_MARK_ADDR_REG + 2 <= CS_REG_SCRATCH_COUNT);
+   STATIC_ASSERT(KBASE_MARK_VALUE_REG + 1 <= CS_REG_SCRATCH_COUNT);
+
    struct cs_builder *b =
       panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
-   struct cs_index sync_addr = cs_scratch_reg64(b, 28);
-   struct cs_index val = cs_scratch_reg32(b, 30);
+   struct cs_index sync_addr = cs_scratch_reg64(b, KBASE_MARK_ADDR_REG);
+   struct cs_index val = cs_scratch_reg32(b, KBASE_MARK_VALUE_REG);
 
    cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
                 offsetof(struct panvk_cs_subqueue_context, syncobjs));
