@@ -449,35 +449,9 @@ kbase_kmod_csf_group_create(struct pan_kmod_dev *dev, uint32_t cs_queue_count,
                             uint32_t *group_handle)
 {
    /* Endpoint masks/maxes match what panfork uses on all CSF parts:
-    * a single tiler unit, all fragment/compute endpoints. */
-   if (pan_kmod_driver_version_at_least(&dev->driver, 1, 18)) {
-      /* Pixel uAPI 1.38 extends this request past the 1.18 fields imported in
-       * this fork.  Keep a zeroed tail in case the kernel dispatches by ioctl
-       * number and copies its larger native struct. */
-      uint64_t req_storage[32] = {0};
-      union kbase_ioctl_cs_queue_group_create *req = (void *)req_storage;
-      STATIC_ASSERT(sizeof(*req) <= sizeof(req_storage));
-
-      req->in.tiler_mask = 1;
-      req->in.fragment_mask = ~0ull;
-      req->in.compute_mask = ~0ull;
-      req->in.cs_min = cs_queue_count;
-      req->in.priority = 1;
-      req->in.tiler_max = 1;
-      req->in.fragment_max = 64;
-      req->in.compute_max = 64;
-      req->in.csi_handlers = BASE_CSF_TILER_OOM_EXCEPTION_FLAG;
-
-      if (!ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, req)) {
-         *group_handle = req->out.group_handle;
-         return 0;
-      }
-
-      mesa_logw("kbase: KBASE_IOCTL_CS_QUEUE_GROUP_CREATE failed: %s; "
-                "falling back to 1.6 group create without tiler OOM handler",
-                strerror(errno));
-   }
-
+    * a single tiler unit, all fragment/compute endpoints.  Tiler heap growth
+    * is serviced by the kernel OOM path; panfork's working CSF path uses this
+    * legacy group-create request without application CSI exception handlers. */
    union kbase_ioctl_cs_queue_group_create_1_6 req = {
       .in = {
          .tiler_mask = 1,
@@ -601,17 +575,20 @@ int
 kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
                                  uint32_t chunk_size, uint32_t initial_chunks,
                                  uint32_t max_chunks,
-                                 uint32_t target_in_flight, uint32_t group_id,
+                                 uint32_t target_in_flight,
+                                 uint32_t mem_group_id,
                                  uint64_t *heap_ctx_va,
                                  uint64_t *first_chunk_va)
 {
+   /* The uAPI group_id is the physical memory group used for allocations,
+    * not the CS queue group handle. */
    union kbase_ioctl_cs_tiler_heap_init req = {
       .in = {
          .chunk_size = chunk_size,
          .initial_chunks = initial_chunks,
          .max_chunks = max_chunks,
          .target_in_flight = MIN2(target_in_flight, UINT16_MAX),
-         .group_id = group_id,
+         .group_id = mem_group_id,
       },
    };
 

@@ -1758,11 +1758,14 @@ init_tiler(struct panvk_gpu_queue *queue)
 #ifdef HAVE_PAN_KMOD_KBASE
    if (gpu_queue_uses_kbase(dev)) {
       uint64_t heap_ctx_va, first_chunk_va;
+      /* KBASE_IOCTL_CS_TILER_HEAP_INIT.group_id selects a physical memory
+       * group.  Keep it on the default group, matching panfork. */
+      const uint32_t tiler_heap_mem_group = 0;
 
       if (kbase_kmod_csf_tiler_heap_create(
              dev->kmod.dev, tiler_heap->chunk_size,
              phys_dev->csf.tiler.initial_chunks, phys_dev->csf.tiler.max_chunks,
-             65535, queue->group_handle, &heap_ctx_va, &first_chunk_va)) {
+             65535, tiler_heap_mem_group, &heap_ctx_va, &first_chunk_va)) {
          result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                                "Failed to create a tiler heap context");
          goto err_free_desc;
@@ -1774,11 +1777,11 @@ init_tiler(struct panvk_gpu_queue *queue)
 
       mesa_logd("kbase: tiler heap ctx 0x%" PRIx64
                 ", first chunk 0x%" PRIx64
-                ", chunk size %u, initial %u, max %u, target %u, group %u",
+                ", chunk size %u, initial %u, max %u, target %u, mem group %u",
                 heap_ctx_va, first_chunk_va, tiler_heap->chunk_size,
                 phys_dev->csf.tiler.initial_chunks,
                 phys_dev->csf.tiler.max_chunks, 65535,
-                queue->group_handle);
+                tiler_heap_mem_group);
    } else
 #endif
    {
