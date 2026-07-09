@@ -38,7 +38,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "util/macros.h"
 #include "util/os_time.h"
@@ -566,6 +568,51 @@ kbase_kmod_csf_queue_kick(struct pan_kmod_dev *dev, uint64_t ringbuf_va)
       mesa_loge("kbase: KBASE_IOCTL_CS_QUEUE_KICK failed: %s",
                 strerror(errno));
       return -1;
+   }
+
+   return 0;
+}
+
+int
+kbase_kmod_csf_wait_event(struct pan_kmod_dev *dev, int64_t timeout_ns)
+{
+   /* Block until the kernel has a CSF notification pending, then drain all
+    * pending notifications with read().  This is what drives kernel-side
+    * servicing of the submitted work (tiler-heap OOM growth, sync-update
+    * wakeups, group scheduling) — a pure userspace spin on the seqno cell
+    * never gives the driver's event path a chance to run.  Mirrors
+    * panfork's poll()+read() CSF wait model. */
+   struct pollfd pfd = {
+      .fd = dev->fd,
+      .events = POLLIN,
+   };
+   struct timespec ts = {
+      .tv_sec = timeout_ns / 1000000000,
+      .tv_nsec = timeout_ns % 1000000000,
+   };
+
+   int ret = ppoll(&pfd, 1, &ts, NULL);
+   if (ret < 0)
+      return (errno == EINTR) ? 0 : -1;
+
+   if (ret == 0 || !(pfd.revents & POLLIN))
+      return 0;
+
+   /* Drain the notification queue; the payload is not needed here, reading
+    * is what lets the kernel make forward progress. */
+   for (;;) {
+      struct base_csf_notification event;
+      ssize_t rd = read(dev->fd, &event, sizeof(event));
+
+      if (rd < 0) {
+         if (errno == EAGAIN)
+            break;
+         if (errno == EINTR)
+            continue;
+         return -1;
+      }
+      if (rd != sizeof(event))
+         break;
    }
 
    return 0;

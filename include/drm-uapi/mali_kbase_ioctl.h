@@ -492,6 +492,20 @@ struct kbase_ioctl_cs_tiler_heap_term {
    _IOW(KBASE_IOCTL_TYPE, 49, struct kbase_ioctl_cs_tiler_heap_term)
 
 /* -----------------------------------------------------------------------
+ * CSF event notification, delivered by read() on the device fd (CSF only).
+ * The struct is always 64 bytes (cache-line sized); we only need its size
+ * and the type tag, so the payload is left as opaque padding.
+ * ----------------------------------------------------------------------- */
+struct base_csf_notification {
+   __u8 type;
+   __u8 padding[7];
+   __u8 payload[56];
+};
+#define BASE_CSF_NOTIFICATION_EVENT                  0
+#define BASE_CSF_NOTIFICATION_GPU_QUEUE_GROUP_ERROR  1
+#define BASE_CSF_NOTIFICATION_CPU_QUEUE_DUMP         2
+
+/* -----------------------------------------------------------------------
  * CSF global interface query (CSF flavour only).
  * First call with max_group_num = max_total_stream_num = 0 to learn the
  * counts (returned in out), then call again with buffers.

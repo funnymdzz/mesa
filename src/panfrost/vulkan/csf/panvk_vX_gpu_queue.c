@@ -755,7 +755,13 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
                                   "kbase: timeout on subqueue %u", subqueue);
       }
 
-      usleep(100);
+      /* Block on a CSF notification (draining the kernel's event queue)
+       * instead of busy-spinning: this is what lets the kernel service the
+       * submitted work — tiler-heap OOM growth, sync-update wakeups and
+       * group scheduling — while we wait.  A pure spin starves that path.
+       * Cap the blocking wait so the re-kick timer and overall timeout
+       * still fire. */
+      kbase_kmod_csf_wait_event(dev->kmod.dev, 20ll * 1000000ll);
    }
 
    return VK_SUCCESS;
