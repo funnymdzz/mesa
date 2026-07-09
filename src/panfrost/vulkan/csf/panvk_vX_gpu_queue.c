@@ -235,6 +235,79 @@ kbase_log_stream_prefix(uint32_t subqueue, uint64_t stream_addr,
    }
 }
 
+static void
+kbase_log_ring_line(const struct panvk_subqueue *subq, uint32_t subqueue,
+                    const char *label, uint64_t byte_offset)
+{
+   uint64_t line = byte_offset & ~(uint64_t)63;
+
+   mesa_loge("kbase: subqueue %u %s ring[0..7] @%" PRIu64
+             " 0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
+             "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64,
+             subqueue, label, line, kbase_ring_qword(subq, line + 0),
+             kbase_ring_qword(subq, line + 8),
+             kbase_ring_qword(subq, line + 16),
+             kbase_ring_qword(subq, line + 24),
+             kbase_ring_qword(subq, line + 32),
+             kbase_ring_qword(subq, line + 40),
+             kbase_ring_qword(subq, line + 48),
+             kbase_ring_qword(subq, line + 56));
+}
+
+static void
+kbase_log_subqueue_state(struct panvk_gpu_queue *queue, uint32_t subqueue,
+                         const char *reason)
+{
+   struct panvk_subqueue *subq = &queue->subqueues[subqueue];
+
+   if (!subq->kbase.user_io || !subq->kbase.ringbuf_cpu)
+      return;
+
+   volatile struct panvk_cs_sync64 *cell =
+      kbase_subqueue_seqno_cell(queue, subqueue);
+   volatile uint64_t *ls_copy =
+      (volatile uint64_t *)((volatile uint8_t *)cell +
+                            KBASE_SEQNO_LS_COPY_OFFSET);
+   volatile uint64_t *mark_pre_call =
+      (volatile uint64_t *)((volatile uint8_t *)cell +
+                            KBASE_SEQNO_MARK_PRE_CALL_OFFSET);
+   volatile uint64_t *mark_post_call =
+      (volatile uint64_t *)((volatile uint8_t *)cell +
+                            KBASE_SEQNO_MARK_POST_CALL_OFFSET);
+   volatile uint64_t *mark_post_wait =
+      (volatile uint64_t *)((volatile uint8_t *)cell +
+                            KBASE_SEQNO_MARK_POST_WAIT_OFFSET);
+   const uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
+   uint64_t extract =
+      *(volatile uint64_t *)(output_page + CS_USER_IO_OUTPUT_CS_EXTRACT);
+   uint32_t active =
+      *(volatile uint32_t *)(output_page + CS_USER_IO_OUTPUT_CS_ACTIVE);
+
+   kbase_cache_invalidate_range((const void *)cell, kbase_seqno_stride());
+
+   mesa_loge("kbase: %s subqueue %u: seqno %" PRIu64 ", ls_copy %" PRIu64
+             ", target %" PRIu64 ", marks 0x%" PRIx64 "/0x%" PRIx64
+             "/0x%" PRIx64 ", insert %" PRIu64 ", extract %" PRIu64
+             ", active %u, error 0x%x, jobs %" PRIu64,
+             reason, subqueue, (uint64_t)cell->seqno, *ls_copy,
+             subq->kbase.emitted_jobs, *mark_pre_call, *mark_post_call,
+             *mark_post_wait, subq->kbase.insert, extract, active,
+             cell->error, subq->kbase.emitted_jobs);
+
+   mesa_loge("kbase: %s subqueue %u last job: ring offset %u, entry "
+             "%u/%u bytes, stream 0x%" PRIx64 "/%u, flush %u",
+             reason, subqueue, subq->kbase.last_job_offset,
+             subq->kbase.last_job_entry_size, subq->kbase.last_job_size,
+             subq->kbase.last_stream_addr, subq->kbase.last_stream_size,
+             subq->kbase.last_flush_id);
+
+   kbase_log_ring_line(subq, subqueue, "extract", extract);
+
+   if (subq->kbase.last_job_size)
+      kbase_log_ring_line(subq, subqueue, "last-job",
+                          subq->kbase.last_job_offset);
+}
+
 static VkResult
 kbase_init_seqnos(struct panvk_gpu_queue *queue)
 {
@@ -611,6 +684,9 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
                    kbase_ring_qword(subq, extract_line + 40),
                    kbase_ring_qword(subq, extract_line + 48),
                    kbase_ring_qword(subq, extract_line + 56));
+
+         for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+            kbase_log_subqueue_state(queue, i, "timeout snapshot");
 
          return vk_queue_set_lost(&queue->vk,
                                   "kbase: timeout on subqueue %u", subqueue);
@@ -1615,6 +1691,13 @@ init_tiler(struct panvk_gpu_queue *queue)
       tiler_heap->context.handle = 0;
       tiler_heap->context.dev_addr = heap_ctx_va;
       first_heap_chunk = first_chunk_va;
+
+      mesa_logd("kbase: tiler heap ctx 0x%" PRIx64
+                ", first chunk 0x%" PRIx64
+                ", chunk size %u, initial %u, max %u, target %u",
+                heap_ctx_va, first_chunk_va, tiler_heap->chunk_size,
+                phys_dev->csf.tiler.initial_chunks,
+                phys_dev->csf.tiler.max_chunks, 65535);
    } else
 #endif
    {
@@ -1645,6 +1728,20 @@ init_tiler(struct panvk_gpu_queue *queue)
       cfg.bottom = cfg.base + 64;
       cfg.top = cfg.base + cfg.size;
    }
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev)) {
+      mesa_logd("kbase: tiler heap desc 0x%" PRIx64
+                ": base 0x%" PRIx64 ", bottom 0x%" PRIx64
+                ", top 0x%" PRIx64 ", geom 0x%" PRIx64
+                ", oom_fbd 0x%" PRIx64,
+                panvk_priv_mem_dev_addr(tiler_heap->desc), first_heap_chunk,
+                first_heap_chunk + 64,
+                first_heap_chunk + tiler_heap->chunk_size,
+                panvk_priv_mem_dev_addr(tiler_heap->desc) + 4096,
+                panvk_priv_mem_dev_addr(tiler_heap->oom_fbd));
+   }
+#endif
 
    return VK_SUCCESS;
 
