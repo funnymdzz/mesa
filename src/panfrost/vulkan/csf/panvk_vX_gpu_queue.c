@@ -258,7 +258,11 @@ kbase_log_stream_prefix(uint32_t subqueue, uint64_t stream_addr,
    if (!stream || !stream_size)
       return;
 
-   for (uint32_t base = 0; base < MIN2(stream_size / sizeof(uint64_t), 96u);
+   /* Dump the whole stream, not just the first 96 qwords: the CALL wrapper
+    * returns when it has executed the callee's full byte length, so the
+    * tail (and any trailing sync/return structure) is exactly what we need
+    * to see when a CALL never returns. */
+   for (uint32_t base = 0; base < stream_size / sizeof(uint64_t);
         base += 8) {
       mesa_logd("kbase: stream subqueue %u 0x%" PRIx64 "/%u qwords[%u..%u] "
                 "0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64 "/0x%" PRIx64
