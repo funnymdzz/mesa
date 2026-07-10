@@ -51,9 +51,9 @@ void kbase_kmod_csf_queue_term(struct pan_kmod_dev *dev, uint64_t ringbuf_va,
 int kbase_kmod_csf_queue_kick(struct pan_kmod_dev *dev, uint64_t ringbuf_va);
 
 /* Block (up to timeout_ns) until the kernel has a CSF notification, then
- * drain the notification queue with read().  Lets the kernel event/OOM/
+ * consume one notification with read().  Lets the kernel event/OOM/
  * scheduler path make progress while userspace waits for completion.
- * Returns 0 on success (event drained or timeout), -1 on error. */
+ * Returns 0 on success (event consumed or timeout), -1 on error. */
 int kbase_kmod_csf_wait_event(struct pan_kmod_dev *dev, int64_t timeout_ns);
 
 int kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
