@@ -51,45 +51,6 @@
 #include "vk_render_pass.h"
 #include "poly/geometry.h"
 
-static bool
-cmd_uses_kbase(struct panvk_cmd_buffer *cmdbuf)
-{
-#ifdef HAVE_PAN_KMOD_KBASE
-   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   struct panvk_physical_device *phys_dev =
-      to_panvk_physical_device(dev->vk.physical);
-
-   return phys_dev->kbase_node_path[0] != '\0';
-#else
-   return false;
-#endif
-}
-
-static void
-kbase_mark_vt_progress(struct panvk_cmd_buffer *cmdbuf, uint32_t marker)
-{
-   if (!cmd_uses_kbase(cmdbuf))
-      return;
-
-   enum {
-      KBASE_MARK_ADDR_REG = 14,
-      KBASE_MARK_VALUE_REG = 16,
-   };
-   STATIC_ASSERT(KBASE_MARK_ADDR_REG + 2 <= CS_REG_SCRATCH_COUNT);
-   STATIC_ASSERT(KBASE_MARK_VALUE_REG + 1 <= CS_REG_SCRATCH_COUNT);
-
-   struct cs_builder *b =
-      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
-   struct cs_index sync_addr = cs_scratch_reg64(b, KBASE_MARK_ADDR_REG);
-   struct cs_index val = cs_scratch_reg32(b, KBASE_MARK_VALUE_REG);
-
-   cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
-                offsetof(struct panvk_cs_subqueue_context, syncobjs));
-   cs_move32_to(b, val, marker);
-   cs_store32(b, val, sync_addr, offsetof(struct panvk_cs_sync64, pad));
-   cs_flush_stores(b);
-}
-
 #if PAN_ARCH < 14
 static enum cs_reg_perm
 provoking_vertex_fn_reg_perm_cb(struct cs_builder *b, unsigned reg)
@@ -2672,7 +2633,9 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
    uint32_t idvs_count = DIV_ROUND_UP(cmdbuf->state.gfx.render.layer_count,
                                       MAX_LAYERS_PER_TILER_DESC);
 
-   kbase_mark_vt_progress(cmdbuf, 0x110);
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_BEFORE_RUN_IDVS);
 
    panvk_cond_render(cmdbuf, b)
    {
@@ -2719,7 +2682,9 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
       }
    }
 
-   kbase_mark_vt_progress(cmdbuf, 0x120);
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_AFTER_RUN_IDVS);
 }
 
 VkResult
@@ -3419,9 +3384,13 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
       return;
 
    /* Flush the tiling operations and signal the internal sync object. */
-   kbase_mark_vt_progress(cmdbuf, 0x200);
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_BEFORE_FINISH_TILING);
    cs_finish_tiling(b);
-   kbase_mark_vt_progress(cmdbuf, 0x210);
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_AFTER_FINISH_TILING);
 
    /* We're relying on PANVK_SUBQUEUE_VERTEX_TILER being the first queue to
     * skip an ADD operation on the syncobjs pointer. */
@@ -3436,11 +3405,15 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
 
    cs_move64_to(b, add_val, 1);
    cs_vt_end(b, cs_defer_indirect());
-   kbase_mark_vt_progress(cmdbuf, 0x220);
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_AFTER_VT_END);
    panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, true,
                           MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
                           cs_defer_indirect());
-   kbase_mark_vt_progress(cmdbuf, 0x230);
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_AFTER_SYNC_SIGNAL);
 #else
    struct cs_index sync_addr = cs_scratch_reg64(b, 0);
    struct cs_index iter_sb = cs_scratch_reg32(b, 2);
@@ -3455,11 +3428,15 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
 
    cs_match_iter_sb(b, x, iter_sb, cmp_scratch) {
       cs_vt_end(b, cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
-      kbase_mark_vt_progress(cmdbuf, 0x220);
+      panvk_per_arch(kbase_mark_progress)(
+         cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+         PANVK_KBASE_PROGRESS_VT_AFTER_VT_END);
       panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, true,
                              MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
                              cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
-      kbase_mark_vt_progress(cmdbuf, 0x230);
+      panvk_per_arch(kbase_mark_progress)(
+         cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+         PANVK_KBASE_PROGRESS_VT_AFTER_SYNC_SIGNAL);
    }
 #endif
 
@@ -3641,6 +3618,9 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
    struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_FRAGMENT);
    bool has_oq_chain = cmdbuf->state.gfx.render.oq.chain != 0;
 
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT, PANVK_KBASE_PROGRESS_FRAG_ENTER);
+
    /* Now initialize the fragment bits. */
    struct cs_index fbd_pointer = cs_sr_reg64(b, FRAGMENT, FBD_POINTER);
    cs_update_frag_ctx(b) {
@@ -3701,7 +3681,13 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
 #endif
 
    /* Wait for the tiling to be done before submitting the fragment job. */
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
+      PANVK_KBASE_PROGRESS_FRAG_BEFORE_TILING_WAIT);
    wait_finish_tiling(cmdbuf);
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
+      PANVK_KBASE_PROGRESS_FRAG_AFTER_TILING_WAIT);
 
    /* Disable the oom handler once the vertex/tiler work has finished.
     * We need to disable the handler at this point as the vertex/tiler subqueue
@@ -3733,6 +3719,10 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
       cs_wait_slot(b, SB_ID(IMM_FLUSH));
    }
 
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
+      PANVK_KBASE_PROGRESS_FRAG_BEFORE_RUN);
+
    if (cmdbuf->state.gfx.render.layer_count <= 1) {
 #if PAN_ARCH >= 14
       cs_trace_run_fragment2(b, tracing_ctx, cs_scratch_reg_tuple(b, 0, 4),
@@ -3762,6 +3752,10 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
             cs_add64(b, fbd_pointer, fbd_pointer, fbd_sz);
       }
    }
+
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
+      PANVK_KBASE_PROGRESS_FRAG_AFTER_RUN);
 
    struct cs_index sync_addr = cs_scratch_reg64(b, 0);
    struct cs_index sb_update_scratch_regs = cs_scratch_reg_tuple(b, 2, 2);
@@ -3885,6 +3879,10 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
       panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_FRAGMENT, true,
                              MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr, async);
    }
+
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
+      PANVK_KBASE_PROGRESS_FRAG_AFTER_FINISH);
 
    /* Update the ring buffer position. */
    if (free_render_descs) {

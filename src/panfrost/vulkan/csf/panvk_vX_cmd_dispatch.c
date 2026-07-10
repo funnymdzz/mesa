@@ -186,6 +186,10 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
 
    struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
 
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_COMPUTE,
+      PANVK_KBASE_PROGRESS_COMPUTE_ENTER);
+
    /* Copy the global TLS pointer to the per-job TSD. */
    if (cs->info.tls_size) {
       cs_move64_to(b, cs_scratch_reg64(b, 0), cmdbuf->state.tls.desc.gpu);
@@ -277,8 +281,15 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
       }
    }
 
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_COMPUTE,
+      PANVK_KBASE_PROGRESS_COMPUTE_BEFORE_ITER);
    cs_next_iter_sb(cmdbuf, PANVK_SUBQUEUE_COMPUTE,
                    cs_scratch_reg_tuple(b, 0, 2));
+
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_COMPUTE,
+      PANVK_KBASE_PROGRESS_COMPUTE_BEFORE_RUN);
 
    panvk_cond_render(cmdbuf, b)
    {
@@ -305,6 +316,10 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
                               PANVK_COMPUTE_RES_SEL);
       }
    }
+
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_COMPUTE,
+      PANVK_KBASE_PROGRESS_COMPUTE_AFTER_RUN);
 
 #if PAN_ARCH >= 11
    struct cs_index sync_addr = cs_scratch_reg64(b, 0);
@@ -339,6 +354,10 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
                              cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
    }
 #endif
+
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_COMPUTE,
+      PANVK_KBASE_PROGRESS_COMPUTE_AFTER_SIGNAL);
 
    ++cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE].relative_sync_point;
    clear_dirty_after_dispatch(cmdbuf);

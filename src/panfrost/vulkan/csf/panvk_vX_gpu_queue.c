@@ -65,6 +65,7 @@
 #define KBASE_SEQNO_MARK_PRE_CALL_OFFSET 24
 #define KBASE_SEQNO_MARK_POST_CALL_OFFSET 32
 #define KBASE_SEQNO_MARK_POST_WAIT_OFFSET 40
+#define KBASE_SEQNO_STREAM_PROGRESS_OFFSET 48
 #define KBASE_SEQNO_MARK_PRE_CALL  0x100000000000ull
 #define KBASE_SEQNO_MARK_POST_CALL 0x200000000000ull
 #define KBASE_SEQNO_MARK_POST_WAIT 0x300000000000ull
@@ -330,6 +331,9 @@ kbase_log_subqueue_state(struct panvk_gpu_queue *queue, uint32_t subqueue,
    volatile uint64_t *mark_post_wait =
       (volatile uint64_t *)((volatile uint8_t *)cell +
                             KBASE_SEQNO_MARK_POST_WAIT_OFFSET);
+   volatile uint32_t *stream_progress =
+      (volatile uint32_t *)((volatile uint8_t *)cell +
+                            KBASE_SEQNO_STREAM_PROGRESS_OFFSET);
    const uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
    uint64_t extract =
       *(volatile uint64_t *)(output_page + CS_USER_IO_OUTPUT_CS_EXTRACT);
@@ -344,8 +348,10 @@ kbase_log_subqueue_state(struct panvk_gpu_queue *queue, uint32_t subqueue,
              ", active %u, error 0x%x, jobs %" PRIu64,
              reason, subqueue, (uint64_t)cell->seqno, *ls_copy,
              subq->kbase.emitted_jobs, *mark_pre_call, *mark_post_call,
-             *mark_post_wait, subq->kbase.insert, extract, active,
-             cell->error, subq->kbase.emitted_jobs);
+             *mark_post_wait, subq->kbase.insert, extract, active, cell->error,
+             subq->kbase.emitted_jobs);
+   mesa_loge("kbase: %s subqueue %u stream progress 0x%x", reason,
+             subqueue, *stream_progress);
 
    mesa_loge("kbase: %s subqueue %u last job: ring offset %u, entry "
              "%u/%u bytes, stream 0x%" PRIx64 "/%u, flush %u",
@@ -508,6 +514,9 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    cs_move64_to(&b, val64, KBASE_SEQNO_MARK_PRE_CALL | target_seqno);
    cs_store64(&b, val64, addr64, KBASE_SEQNO_MARK_PRE_CALL_OFFSET);
    cs_wait_slot(&b, SB_ID(LS));
+   cs_move32_to(&b, val32, 0);
+   cs_store32(&b, val32, addr64, KBASE_SEQNO_STREAM_PROGRESS_OFFSET);
+   cs_wait_slot(&b, SB_ID(LS));
 
    if (stream_size) {
       /* Make CPU-written command-stream/descriptor memory visible to the
@@ -647,6 +656,9 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
    volatile uint64_t *mark_post_wait =
       (volatile uint64_t *)((volatile uint8_t *)cell +
                             KBASE_SEQNO_MARK_POST_WAIT_OFFSET);
+   volatile uint32_t *stream_progress =
+      (volatile uint32_t *)((volatile uint8_t *)cell +
+                            KBASE_SEQNO_STREAM_PROGRESS_OFFSET);
    const uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
    uint64_t target_seqno = subq->kbase.emitted_jobs;
    uint64_t target_insert = subq->kbase.insert;
@@ -698,14 +710,15 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
                    ", ls_copy %" PRIu64 ", target %" PRIu64
                    ", marks pre/post-call/post-wait 0x%" PRIx64
                    "/0x%" PRIx64 "/0x%" PRIx64
+                   ", stream progress 0x%x"
                    ", insert %" PRIu64 ", extract %" PRIu64
                    ", active %u, error 0x%x"
                    ", ring[0..3] 0x%" PRIx64 "/0x%" PRIx64
                    "/0x%" PRIx64 "/0x%" PRIx64,
                    subqueue, (uint64_t)cell->seqno, *ls_copy,
                    target_seqno, *mark_pre_call, *mark_post_call,
-                   *mark_post_wait, target_insert, extract, active,
-                   cell->error, ring[0], ring[1], ring[2], ring[3]);
+                   *mark_post_wait, *stream_progress, target_insert, extract,
+                   active, cell->error, ring[0], ring[1], ring[2], ring[3]);
          mesa_loge("kbase: last job on subqueue %u: ring offset %u, entry "
                    "%u/%u bytes, stream 0x%" PRIx64 "/%u, flush %u, "
                    "extract offset %" PRIu64,
@@ -1393,6 +1406,14 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
 #endif
          .reg_dump_addr = panvk_priv_mem_dev_addr(subq->regs_save),
       };
+
+#ifdef HAVE_PAN_KMOD_KBASE
+      if (gpu_queue_uses_kbase(dev)) {
+         cs_ctx->debug.kbase_progress_addr =
+            kbase_subqueue_seqno_dev_addr(queue, subqueue) +
+            KBASE_SEQNO_STREAM_PROGRESS_OFFSET;
+      }
+#endif
 
       if (subqueue != PANVK_SUBQUEUE_COMPUTE) {
          cs_ctx->render.tiler_heap =
