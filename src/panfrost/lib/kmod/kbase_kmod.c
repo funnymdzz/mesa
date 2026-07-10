@@ -450,10 +450,43 @@ int
 kbase_kmod_csf_group_create(struct pan_kmod_dev *dev, uint32_t cs_queue_count,
                             uint32_t *group_handle)
 {
+   STATIC_ASSERT(sizeof(union kbase_ioctl_cs_queue_group_create_1_18) == 40);
+   STATIC_ASSERT(sizeof(union kbase_ioctl_cs_queue_group_create) == 112);
+
    /* Endpoint masks/maxes match what panfork uses on all CSF parts:
     * a single tiler unit, all fragment/compute endpoints.  Tiler heap growth
-    * is serviced by the kernel OOM path; panfork's working CSF path uses this
-    * legacy group-create request without application CSI exception handlers. */
+    * is serviced by the kernel OOM path, so no application CSI exception
+    * handler is requested.  On uAPI 1.25+ use the current ioctl layout to ask
+    * the kernel to report recoverable CS faults through read(). */
+   if (pan_kmod_driver_version_at_least(&dev->driver, 1, 25)) {
+      union kbase_ioctl_cs_queue_group_create req = {
+         .in = {
+            .tiler_mask = 1,
+            .fragment_mask = ~0ull,
+            .compute_mask = ~0ull,
+            .cs_min = cs_queue_count,
+            .priority = 1,
+            .tiler_max = 1,
+            .fragment_max = 64,
+            .compute_max = 64,
+            .cs_fault_report_enable = 1,
+         },
+      };
+
+      if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &req) == 0) {
+         *group_handle = req.out.group_handle;
+         mesa_logd("kbase: created CSF group %u with CS fault reporting",
+                   *group_handle);
+         return 0;
+      }
+
+      mesa_logw("kbase: current CS_QUEUE_GROUP_CREATE failed: %s; "
+                "falling back to the 1.6 ABI",
+                strerror(errno));
+   }
+
+   /* The legacy request remains the compatibility fallback and leaves tiler
+    * OOM handling in the kernel, matching panfork's working CSF path. */
    union kbase_ioctl_cs_queue_group_create_1_6 req = {
       .in = {
          .tiler_mask = 1,
@@ -475,6 +508,97 @@ kbase_kmod_csf_group_create(struct pan_kmod_dev *dev, uint32_t cs_queue_count,
 
    *group_handle = req.out.group_handle;
    return 0;
+}
+
+static void
+kbase_log_csf_queue_error(const char *kind, uint8_t group_handle,
+                          uint8_t csi_index, uint32_t status,
+                          uint64_t sideband, uint8_t has_extra,
+                          uint32_t trace_id0, uint32_t trace_id1,
+                          uint32_t trace_task)
+{
+   mesa_loge("kbase: CSF group %u CSI %u %s: status 0x%08x "
+             "(exception 0x%02x), sideband 0x%016" PRIx64,
+             group_handle, csi_index, kind, status, status & 0xff, sideband);
+
+   if (has_extra) {
+      mesa_loge("kbase: CSF group %u CSI %u fault trace: id0 0x%08x, "
+                "id1 0x%08x, task 0x%08x",
+                group_handle, csi_index, trace_id0, trace_id1, trace_task);
+   }
+}
+
+static void
+kbase_log_csf_notification(const struct base_csf_notification *event)
+{
+   STATIC_ASSERT(sizeof(struct base_csf_notification) == 64);
+
+   if (event->type == BASE_CSF_NOTIFICATION_EVENT) {
+      mesa_logd("kbase: received CSF event notification");
+      return;
+   }
+
+   if (event->type == BASE_CSF_NOTIFICATION_CPU_QUEUE_DUMP) {
+      mesa_logw("kbase: received CSF CPU queue dump notification");
+      return;
+   }
+
+   if (event->type != BASE_CSF_NOTIFICATION_GPU_QUEUE_GROUP_ERROR) {
+      mesa_logw("kbase: received unknown CSF notification type %u",
+                event->type);
+      return;
+   }
+
+   const uint8_t group_handle = event->payload.csg_error.handle;
+   const struct base_gpu_queue_group_error *error =
+      &event->payload.csg_error.error;
+
+   switch (error->error_type) {
+   case BASE_GPU_QUEUE_GROUP_ERROR_FATAL: {
+      const struct base_gpu_queue_group_error_fatal_payload *payload =
+         &error->payload.fatal_group;
+      mesa_loge("kbase: CSF group %u fatal error: status 0x%08x "
+                "(exception 0x%02x), sideband 0x%016" PRIx64,
+                group_handle, payload->status, payload->status & 0xff,
+                (uint64_t)payload->sideband);
+      break;
+   }
+
+   case BASE_GPU_QUEUE_GROUP_QUEUE_ERROR_FATAL: {
+      const struct base_gpu_queue_error_fatal_payload *payload =
+         &error->payload.fatal_queue;
+      kbase_log_csf_queue_error(
+         "fatal error", group_handle, payload->csi_index, payload->status,
+         payload->sideband, payload->has_extra, payload->trace_id0,
+         payload->trace_id1, payload->trace_task);
+      break;
+   }
+
+   case BASE_GPU_QUEUE_GROUP_ERROR_TIMEOUT:
+      mesa_loge("kbase: CSF group %u progress timeout notification",
+                group_handle);
+      break;
+
+   case BASE_GPU_QUEUE_GROUP_ERROR_TILER_HEAP_OOM:
+      mesa_loge("kbase: CSF group %u tiler heap OOM notification",
+                group_handle);
+      break;
+
+   case BASE_GPU_QUEUE_GROUP_QUEUE_ERROR_FAULT: {
+      const struct base_gpu_queue_error_fault_payload *payload =
+         &error->payload.fault_queue;
+      kbase_log_csf_queue_error(
+         "recoverable fault", group_handle, payload->csi_index,
+         payload->status, payload->sideband, payload->has_extra,
+         payload->trace_id0, payload->trace_id1, payload->trace_task);
+      break;
+   }
+
+   default:
+      mesa_loge("kbase: CSF group %u unknown error type %u", group_handle,
+                error->error_type);
+      break;
+   }
 }
 
 void
@@ -600,8 +724,8 @@ kbase_kmod_csf_wait_event(struct pan_kmod_dev *dev, int64_t timeout_ns)
 
    /* The kbase fd is blocking.  Read exactly one notification after poll;
     * trying to drain it until EAGAIN would block forever after the final
-    * pending record.  The payload is not needed here, and another queued
-    * record will make the next poll return immediately. */
+    * pending record.  Another queued record will make the next poll return
+    * immediately. */
    struct base_csf_notification event;
    ssize_t rd;
 
@@ -616,6 +740,8 @@ kbase_kmod_csf_wait_event(struct pan_kmod_dev *dev, int64_t timeout_ns)
       errno = EIO;
       return -1;
    }
+
+   kbase_log_csf_notification(&event);
 
    return 0;
 }

@@ -405,12 +405,12 @@ union kbase_ioctl_cs_queue_group_create_1_6 {
 #define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6 \
    _IOWR(KBASE_IOCTL_TYPE, 42, union kbase_ioctl_cs_queue_group_create_1_6)
 
-/* Extended version (uAPI >= 1.18) */
+/* Extended versions (uAPI >= 1.18). */
 #define BASE_CSF_TILER_OOM_EXCEPTION_FLAG (1u << 0)
 #define BASE_CSF_EXCEPTION_HANDLER_FLAGS_MASK \
    BASE_CSF_TILER_OOM_EXCEPTION_FLAG
 
-union kbase_ioctl_cs_queue_group_create {
+union kbase_ioctl_cs_queue_group_create_1_18 {
    struct {
       __u64 tiler_mask;
       __u64 fragment_mask;
@@ -422,7 +422,37 @@ union kbase_ioctl_cs_queue_group_create {
       __u8 compute_max;
       __u8 csi_handlers;
       __u8 padding[2];
-      __u64 reserved;
+      __u64 dvs_buf;
+   } in;
+   struct {
+      __u8 group_handle;
+      __u8 padding[3];
+      __u32 group_uid;
+   } out;
+};
+#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_18 \
+   _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create_1_18)
+
+/* Current queue-group create layout (uAPI >= 1.25).  The reserved tail keeps
+ * the ioctl size stable as new fields are introduced. */
+union kbase_ioctl_cs_queue_group_create {
+   struct {
+      __u64 tiler_mask;
+      __u64 fragment_mask;
+      __u64 compute_mask;
+      __u8 cs_min;
+      __u8 priority;
+      __u8 tiler_max;
+      __u8 fragment_max;
+      __u8 compute_max;
+      __u8 csi_handlers;
+      __u8 neural_max;
+      __u8 cs_fault_report_enable;
+      __u64 dvs_buf;
+      __u64 neural_mask;
+      __u8 comp_pri_threshold;
+      __u8 comp_pri_ratio;
+      __u8 padding[62];
    } in;
    struct {
       __u8 group_handle;
@@ -492,18 +522,75 @@ struct kbase_ioctl_cs_tiler_heap_term {
    _IOW(KBASE_IOCTL_TYPE, 49, struct kbase_ioctl_cs_tiler_heap_term)
 
 /* -----------------------------------------------------------------------
- * CSF event notification, delivered by read() on the device fd (CSF only).
- * The struct is always 64 bytes (cache-line sized); we only need its size
- * and the type tag, so the payload is left as opaque padding.
+ * CSF event notifications, delivered by read() on the device fd (CSF only).
  * ----------------------------------------------------------------------- */
+struct base_gpu_queue_group_error_fatal_payload {
+   __u64 sideband;
+   __u32 status;
+   __u8 padding[20];
+};
+
+struct base_gpu_queue_error_fatal_payload {
+   __u64 sideband;
+   __u32 status;
+   __u8 csi_index;
+   __u8 padding[6];
+   __u8 has_extra;
+   __u32 trace_id0;
+   __u32 trace_id1;
+   __u32 trace_task;
+};
+
+struct base_gpu_queue_error_fault_payload {
+   __u64 sideband;
+   __u32 status;
+   __u8 csi_index;
+   __u8 padding[6];
+   __u8 has_extra;
+   __u32 trace_id0;
+   __u32 trace_id1;
+   __u32 trace_task;
+};
+
+enum base_gpu_queue_group_error_type {
+   BASE_GPU_QUEUE_GROUP_ERROR_FATAL = 0,
+   BASE_GPU_QUEUE_GROUP_QUEUE_ERROR_FATAL,
+   BASE_GPU_QUEUE_GROUP_ERROR_TIMEOUT,
+   BASE_GPU_QUEUE_GROUP_ERROR_TILER_HEAP_OOM,
+   BASE_GPU_QUEUE_GROUP_QUEUE_ERROR_FAULT,
+   BASE_GPU_QUEUE_GROUP_ERROR_FATAL_COUNT,
+};
+
+struct base_gpu_queue_group_error {
+   __u8 error_type;
+   __u8 padding[7];
+   union {
+      struct base_gpu_queue_group_error_fatal_payload fatal_group;
+      struct base_gpu_queue_error_fatal_payload fatal_queue;
+      struct base_gpu_queue_error_fault_payload fault_queue;
+   } payload;
+};
+
+enum base_csf_notification_type {
+   BASE_CSF_NOTIFICATION_EVENT = 0,
+   BASE_CSF_NOTIFICATION_GPU_QUEUE_GROUP_ERROR,
+   BASE_CSF_NOTIFICATION_CPU_QUEUE_DUMP,
+   BASE_CSF_NOTIFICATION_COUNT,
+};
+
+/* This structure is fixed at one 64-byte cache line. */
 struct base_csf_notification {
    __u8 type;
    __u8 padding[7];
-   __u8 payload[56];
+   union {
+      struct {
+         __u8 handle;
+         __u8 padding[7];
+         struct base_gpu_queue_group_error error;
+      } csg_error;
+      __u8 align[56];
+   } payload;
 };
-#define BASE_CSF_NOTIFICATION_EVENT                  0
-#define BASE_CSF_NOTIFICATION_GPU_QUEUE_GROUP_ERROR  1
-#define BASE_CSF_NOTIFICATION_CPU_QUEUE_DUMP         2
 
 /* -----------------------------------------------------------------------
  * CSF global interface query (CSF flavour only).
