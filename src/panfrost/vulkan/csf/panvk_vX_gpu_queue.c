@@ -598,7 +598,6 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
-   uint8_t *doorbell_page = (uint8_t *)subq->kbase.user_io;
    uint8_t *input_page = (uint8_t *)subq->kbase.user_io + 4096;
 
    /* Drain the ring writes all the way to GPU-visible memory before the
@@ -609,10 +608,10 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
    *(volatile uint64_t *)(input_page + CS_USER_IO_INPUT_CS_INSERT) =
       subq->kbase.insert;
 
-   /* And make the new insert offset itself visible before the kick. */
-   kbase_gpu_wmb();
-
-   *(volatile uint32_t *)doorbell_page = 1;
+   /* Make the new insert offset visible before asking kbase to schedule or
+    * resume the queue.  Do not ring the userspace doorbell here: unlike the
+    * ioctl, it is only safe for an already-active CSI and can race a group
+    * suspend. */
    kbase_gpu_wmb();
 
    kbase_kmod_csf_queue_kick(dev->kmod.dev, subq->kbase.ringbuf_dev);
