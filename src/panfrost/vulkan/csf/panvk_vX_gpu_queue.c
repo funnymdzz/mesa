@@ -620,7 +620,7 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
 
 static VkResult
 kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
-                         uint32_t rekick_mask)
+                         uint32_t rekick_mask, bool allow_ring_drain)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
@@ -658,7 +658,8 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
                                                CS_USER_IO_OUTPUT_CS_ACTIVE);
 
       kbase_cache_invalidate_range((const void *)cell, kbase_seqno_stride());
-      if (cell->seqno >= target_seqno || *ls_copy >= target_seqno)
+      if (cell->seqno >= target_seqno || *ls_copy >= target_seqno ||
+          (allow_ring_drain && extract >= target_insert && !active))
          break;
 
       if (cell->error) {
@@ -761,9 +762,12 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
 
    mesa_logd("kbase: completed subqueue %u job %" PRIu64
              ": seqno %" PRIu64 ", ls_copy %" PRIu64
-             ", stream progress 0x%x",
+             ", stream progress 0x%x%s",
              subqueue, target_seqno, (uint64_t)cell->seqno, *ls_copy,
-             *stream_progress);
+             *stream_progress,
+             cell->seqno >= target_seqno || *ls_copy >= target_seqno
+                ? ""
+                : " (ring-drain init fallback)");
 
    return VK_SUCCESS;
 }
@@ -1150,7 +1154,11 @@ kbase_submit_init_subqueues(struct panvk_gpu_queue *queue)
       kbase_subqueue_publish(queue, i);
 
    u_foreach_bit(i, touched) {
-      VkResult res = kbase_subqueue_wait_idle(queue, i, touched);
+      /* Init streams only program CS registers and heap/context state; they do
+       * not launch asynchronous GPU jobs.  Some kbase mappings do not expose
+       * the wrapper's diagnostic LS writes for every CSI, so ring drain is a
+       * sufficient fallback here.  Ordinary submissions never use it. */
+      VkResult res = kbase_subqueue_wait_idle(queue, i, touched, true);
       if (res != VK_SUCCESS)
          return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
                              "Failed to initialize subqueue");
@@ -2334,7 +2342,7 @@ panvk_queue_submit_ioctl_kbase(struct panvk_queue_submit *submit,
       kbase_subqueue_publish(queue, i);
 
    u_foreach_bit(i, touched) {
-      result = kbase_subqueue_wait_idle(queue, i, touched);
+      result = kbase_subqueue_wait_idle(queue, i, touched, false);
       if (result != VK_SUCCESS)
          return result;
    }
