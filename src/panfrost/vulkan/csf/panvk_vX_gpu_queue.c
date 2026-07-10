@@ -47,11 +47,10 @@
  * the USER_IO input page and kick the scheduler.
  *
  * Synchronization is currently fully synchronous: every submission is
- * CPU-waited (by polling the kbase CS_EXTRACT pointer and, where visible,
- * a per-subqueue seqno cell bumped by a deferred SYNC_ADD64 that waits on
- * all scoreboard slots first), and semaphore waits/signals are resolved on
- * the CPU.  Asynchronous submission needs a real kbase fence/event
- * integration and is left for later.
+ * CPU-waited on a per-subqueue completion cell written after all scoreboard
+ * slots have retired, and semaphore waits/signals are resolved on the CPU.
+ * Asynchronous submission needs a real kbase fence/event integration and is
+ * left for later.
  */
 
 #define KBASE_RINGBUF_SIZE     (64 * 1024)
@@ -648,9 +647,10 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
    int64_t start = os_time_get_nano();
    int64_t last_kick = start;
 
-   /* Completion is signaled through CS_EXTRACT, and also through a SYNC_ADD64
-    * (cell->seqno) plus a plain LS store (ls_copy) when those writes are
-    * visible through the proprietary kbase memory mapping. */
+   /* CS_EXTRACT only reports how far firmware has fetched the command stream;
+    * asynchronous GPU jobs issued by those commands may still be running.
+    * Only accept the completion writes emitted after the all-scoreboard wait.
+    */
    while (true) {
       uint64_t extract = *(volatile uint64_t *)(output_page +
                                                 CS_USER_IO_OUTPUT_CS_EXTRACT);
@@ -658,8 +658,7 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
                                                CS_USER_IO_OUTPUT_CS_ACTIVE);
 
       kbase_cache_invalidate_range((const void *)cell, kbase_seqno_stride());
-      if (extract >= target_insert || cell->seqno >= target_seqno ||
-          *ls_copy >= target_seqno)
+      if (cell->seqno >= target_seqno || *ls_copy >= target_seqno)
          break;
 
       if (cell->error) {
@@ -759,6 +758,12 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
        * still fire. */
       kbase_kmod_csf_wait_event(dev->kmod.dev, 20ll * 1000000ll);
    }
+
+   mesa_logd("kbase: completed subqueue %u job %" PRIu64
+             ": seqno %" PRIu64 ", ls_copy %" PRIu64
+             ", stream progress 0x%x",
+             subqueue, target_seqno, (uint64_t)cell->seqno, *ls_copy,
+             *stream_progress);
 
    return VK_SUCCESS;
 }
