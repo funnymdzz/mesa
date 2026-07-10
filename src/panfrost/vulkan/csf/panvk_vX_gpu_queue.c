@@ -84,11 +84,12 @@ kbase_resource_mask(enum panvk_subqueue_id subqueue)
    case PANVK_SUBQUEUE_VERTEX_TILER:
       /* The kbase userspace queue wrapper is the residency contract seen by
        * the proprietary scheduler/firmware.  Match the working CSF userspace
-       * layout: vertex/tiler also needs COMPUTE, while the fragment and
-       * compute queues request only their own endpoint. */
+       * layout for vertex/tiler.  PanVK's kbase wrapper also needs COMPUTE
+       * resident on the fragment queue: a fragment-only request stalls before
+       * the first LS marker on this firmware. */
       return CS_COMPUTE_RES | CS_IDVS_RES | CS_TILER_RES;
    case PANVK_SUBQUEUE_FRAGMENT:
-      return CS_FRAG_RES;
+      return CS_COMPUTE_RES | CS_FRAG_RES;
    case PANVK_SUBQUEUE_COMPUTE:
       return CS_COMPUTE_RES;
    default:
