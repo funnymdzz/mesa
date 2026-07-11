@@ -82,14 +82,9 @@ kbase_resource_mask(enum panvk_subqueue_id subqueue)
 {
    switch (subqueue) {
    case PANVK_SUBQUEUE_VERTEX_TILER:
-      /* The kbase userspace queue wrapper is the residency contract seen by
-       * the proprietary scheduler/firmware.  Match the working CSF userspace
-       * layout for vertex/tiler.  PanVK's kbase wrapper also needs COMPUTE
-       * resident on the fragment queue: a fragment-only request stalls before
-       * the first LS marker on this firmware. */
-      return CS_COMPUTE_RES | CS_IDVS_RES | CS_TILER_RES;
+      return CS_IDVS_RES | CS_TILER_RES;
    case PANVK_SUBQUEUE_FRAGMENT:
-      return CS_COMPUTE_RES | CS_FRAG_RES;
+      return CS_FRAG_RES;
    case PANVK_SUBQUEUE_COMPUTE:
       return CS_COMPUTE_RES;
    default:
@@ -787,10 +782,13 @@ kbase_destroy_group(struct panvk_gpu_queue *queue)
       pan_kmod_bo_put(subq->kbase.ringbuf_bo);
       subq->kbase.ringbuf_bo = NULL;
       subq->kbase.user_io = NULL;
-   }
 
-   if (queue->group_handle != UINT32_MAX)
-      kbase_kmod_csf_group_destroy(dev->kmod.dev, queue->group_handle);
+      if (subq->kbase.group_handle != UINT32_MAX) {
+         kbase_kmod_csf_group_destroy(dev->kmod.dev,
+                                      subq->kbase.group_handle);
+         subq->kbase.group_handle = UINT32_MAX;
+      }
+   }
 }
 
 static VkResult
@@ -801,16 +799,18 @@ kbase_create_group(struct panvk_gpu_queue *queue)
 
    queue->group_handle = UINT32_MAX;
 
-   uint32_t group_handle;
-   if (kbase_kmod_csf_group_create(dev->kmod.dev, PANVK_SUBQUEUE_COUNT,
-                                   &group_handle))
-      return panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
-                          "Failed to create a kbase queue group");
-
-   queue->group_handle = group_handle;
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+      queue->subqueues[i].kbase.group_handle = UINT32_MAX;
 
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       struct panvk_subqueue *subq = &queue->subqueues[i];
+
+      if (kbase_kmod_csf_group_create(dev->kmod.dev, 1,
+                                      &subq->kbase.group_handle)) {
+         result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                               "Failed to create a kbase queue group");
+         goto err_destroy_group;
+      }
 
       subq->kbase.ringbuf_bo =
          pan_kmod_bo_alloc(dev->kmod.dev, dev->kmod.vm, KBASE_RINGBUF_SIZE,
@@ -850,7 +850,8 @@ kbase_create_group(struct panvk_gpu_queue *queue)
       subq->kbase.ringbuf_dev = op.va.start;
 
       subq->kbase.user_io = kbase_kmod_csf_queue_bind(
-         dev->kmod.dev, queue->group_handle, i, subq->kbase.ringbuf_dev,
+         dev->kmod.dev, subq->kbase.group_handle, 0,
+         subq->kbase.ringbuf_dev,
          KBASE_RINGBUF_SIZE);
       if (!subq->kbase.user_io) {
          result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
@@ -860,9 +861,10 @@ kbase_create_group(struct panvk_gpu_queue *queue)
 
       subq->kbase.insert = 0;
       subq->kbase.emitted_jobs = 0;
-      mesa_logd("kbase: bound subqueue %u to CSI %u, ring CPU %p, "
+      mesa_logd("kbase: bound subqueue %u to group %u CSI0, ring CPU %p, "
                 "ring VA 0x%" PRIx64 ", user_io %p",
-                i, i, subq->kbase.ringbuf_cpu, subq->kbase.ringbuf_dev,
+                i, subq->kbase.group_handle, subq->kbase.ringbuf_cpu,
+                subq->kbase.ringbuf_dev,
                 subq->kbase.user_io);
    }
 
@@ -1130,7 +1132,6 @@ static VkResult
 kbase_submit_init_subqueues(struct panvk_gpu_queue *queue)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-   uint32_t touched = 0;
 
    for (uint32_t subqueue = 0; subqueue < PANVK_SUBQUEUE_COUNT; subqueue++) {
       struct panvk_subqueue *subq = &queue->subqueues[subqueue];
@@ -1146,19 +1147,13 @@ kbase_submit_init_subqueues(struct panvk_gpu_queue *queue)
          return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
                              "Failed to initialize subqueue");
 
-      touched |= BITFIELD_BIT(subqueue);
       subq->kbase.init_pending = 0;
-   }
 
-   u_foreach_bit(i, touched)
-      kbase_subqueue_publish(queue, i);
-
-   u_foreach_bit(i, touched) {
-      /* Init streams only program CS registers and heap/context state; they do
-       * not launch asynchronous GPU jobs.  Some kbase mappings do not expose
-       * the wrapper's diagnostic LS writes for every CSI, so ring drain is a
-       * sufficient fallback here.  Ordinary submissions never use it. */
-      VkResult res = kbase_subqueue_wait_idle(queue, i, touched, true);
+      /* Start and validate each independent CSG before moving to the next
+       * subqueue.  A drained ring is not sufficient proof that its CS ran. */
+      kbase_subqueue_publish(queue, subqueue);
+      res = kbase_subqueue_wait_idle(queue, subqueue,
+                                     BITFIELD_BIT(subqueue), false);
       if (res != VK_SUCCESS)
          return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
                              "Failed to initialize subqueue");

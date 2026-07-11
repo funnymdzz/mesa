@@ -69,6 +69,11 @@ struct panvk_subqueue {
    /* kbase-backed queues manage the CS ring buffer in userspace (the
     * panthor kernel driver does the equivalent in kernel-owned rings). */
    struct {
+      /* kbase compatibility path: each PanVK subqueue owns a CSG and uses
+       * CSI0.  Some Android kbase stacks accept later CSIs into a scheduled
+       * CSG but never execute them. */
+      uint32_t group_handle;
+
       struct pan_kmod_bo *ringbuf_bo;
       void *ringbuf_cpu;
       uint64_t ringbuf_dev;
