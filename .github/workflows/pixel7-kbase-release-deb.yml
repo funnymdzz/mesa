@@ -106,7 +106,7 @@ jobs:
             -Dllvm=enabled \
             -Dmesa-clc=enabled \
             -Dopengl=false \
-            -Dpanfrost-kmds=kbase \
+            -Dpanfrost-kmds=kbase,panthor \
             -Dplatforms=x11 \
             -Dprecomp-compiler=enabled \
             -Dshared-glapi=disabled \
