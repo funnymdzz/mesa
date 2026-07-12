@@ -18,6 +18,7 @@
 #if defined(HAVE_PAN_KMOD_KBASE)
 #include <limits.h>
 #include <stdio.h>
+#include <unistd.h>
 #endif
 
 #include "vk_alloc.h"
@@ -192,6 +193,12 @@ panvk_enumerate_physical_devices(struct vk_instance *vk_instance)
    for (int i = 0; i < PAN_KBASE_MAX_NODES; i++) {
       char path[PATH_MAX];
       snprintf(path, sizeof(path), "/dev/mali%d", i);
+
+      /* Missing optional nodes are normal and should not emit loader
+       * warnings.  Existing nodes still go through full initialization so
+       * permission and uAPI failures remain visible. */
+      if (access(path, F_OK) != 0)
+         continue;
 
       struct panvk_physical_device *device =
          vk_zalloc(&instance->vk.alloc, sizeof(*device), 8,

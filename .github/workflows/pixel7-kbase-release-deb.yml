@@ -1,0 +1,235 @@
+---
+name: Pixel 7 kbase release Debian package
+
+'on':
+  workflow_dispatch:
+  push:
+    tags:
+      - 'kbase-v*'
+    paths:
+      - '.github/workflows/pixel7-kbase-release-deb.yml'
+      - 'include/drm-uapi/mali_kbase_ioctl.h'
+      - 'meson.build'
+      - 'meson.options'
+      - 'src/panfrost/**'
+      - 'src/vulkan/**'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-deb:
+    name: Build minimal arm64 PanVK kbase package
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:13
+    env:
+      BUILD_DIR: build-release
+      PACKAGE_NAME: mesa-panvk-kbase
+      MULTIARCH_LIBDIR: lib/aarch64-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends \
+            bison \
+            build-essential \
+            ca-certificates \
+            dpkg-dev \
+            flex \
+            gh \
+            glslang-tools \
+            libclang-cpp-dev \
+            libclang-dev \
+            libdrm-dev \
+            libelf-dev \
+            libexpat1-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-dri3-dev \
+            libxcb-present-dev \
+            libxcb-randr0-dev \
+            libxcb-shm0-dev \
+            libxcb-sync-dev \
+            libxcb-xfixes0-dev \
+            libxshmfence-dev \
+            libxxf86vm-dev \
+            llvm-dev \
+            ninja-build \
+            pkgconf \
+            python3 \
+            python3-mako \
+            python3-packaging \
+            python3-pip \
+            python3-setuptools \
+            python3-yaml \
+            spirv-tools \
+            zlib1g-dev
+          LLVM_MAJOR="$(llvm-config --version | cut -d. -f1)"
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends \
+            "libclc-${LLVM_MAJOR}-dev" \
+            "libllvmspirvlib-${LLVM_MAJOR}-dev"
+
+      - name: Install Meson
+        run: |
+          python3 -m pip install --break-system-packages \
+            'meson>=1.4.0,<2'
+
+      - name: Configure minimal release build
+        run: |
+          meson setup "${BUILD_DIR}" \
+            --buildtype=release \
+            --prefix=/usr \
+            --libdir="${MULTIARCH_LIBDIR}" \
+            -Db_ndebug=true \
+            -Dbuild-tests=false \
+            -Ddisplay-info=disabled \
+            -Degl=disabled \
+            -Denable-glcpp-tests=false \
+            -Dgallium-drivers= \
+            -Dgbm=disabled \
+            -Dgles1=disabled \
+            -Dgles2=disabled \
+            -Dglx=disabled \
+            -Dinstall-mesa-clc=false \
+            -Dinstall-precomp-compiler=false \
+            -Dlibunwind=disabled \
+            -Dlmsensors=disabled \
+            -Dllvm=enabled \
+            -Dmesa-clc=enabled \
+            -Dopengl=false \
+            -Dpanfrost-kmds=kbase \
+            -Dplatforms=x11 \
+            -Dprecomp-compiler=enabled \
+            -Dshared-glapi=disabled \
+            -Dtools= \
+            -Dvalgrind=disabled \
+            -Dvideo-codecs= \
+            -Dvulkan-drivers=panfrost \
+            -Dvulkan-layers= \
+            -Dxmlconfig=disabled \
+            -Dzstd=disabled
+
+      - name: Build
+        run: meson compile -C "${BUILD_DIR}" -j "$(nproc)"
+
+      - name: Build Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MESA_VERSION="$(tr -d '[:space:]' < VERSION)"
+          MESA_VERSION="${MESA_VERSION/-devel/~devel}"
+          PACKAGE_VERSION="${MESA_VERSION}+git$(git rev-parse --short=12 HEAD)-1"
+          PACKAGE_ROOT="${GITHUB_WORKSPACE}/package-root"
+          PACKAGE_FILE="${PACKAGE_NAME}_${PACKAGE_VERSION}_arm64.deb"
+          LIBDIR="${PACKAGE_ROOT}/usr/${MULTIARCH_LIBDIR}"
+          ICDDIR="${PACKAGE_ROOT}/usr/share/vulkan/icd.d"
+          DOCDIR="${PACKAGE_ROOT}/usr/share/doc/${PACKAGE_NAME}"
+
+          mkdir -p \
+            "${PACKAGE_ROOT}/DEBIAN" "${LIBDIR}" "${ICDDIR}" "${DOCDIR}" \
+            debian
+
+          install -m755 \
+            "${BUILD_DIR}/src/panfrost/vulkan/libvulkan_panfrost.so" \
+            "${LIBDIR}/libvulkan_panfrost_kbase.so"
+          strip --strip-unneeded "${LIBDIR}/libvulkan_panfrost_kbase.so"
+
+          python3 - "${BUILD_DIR}/src/panfrost/vulkan/panfrost_icd.aarch64.json" \
+            "${ICDDIR}/panfrost_kbase_icd.aarch64.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              manifest = json.load(source)
+          manifest["ICD"]["library_path"] = \
+              "/usr/lib/aarch64-linux-gnu/libvulkan_panfrost_kbase.so"
+          with open(sys.argv[2], "w", encoding="utf-8") as output:
+              json.dump(manifest, output, indent=4)
+              output.write("\n")
+          PY
+
+          cat > "${DOCDIR}/README.Debian" <<'EOF'
+          mesa-panvk-kbase demonstration setup
+          ====================================
+
+          Termux:X11 exposes a filesystem Unix socket on the tested setup:
+
+            export DISPLAY=unix/:0
+
+          The ICD is installed system-wide and should be discovered
+          automatically. To select it explicitly for a demonstration:
+
+            export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/panfrost_kbase_icd.aarch64.json
+            vkcube
+            vkmark
+            MESA_LOADER_DRIVER_OVERRIDE=zink glxgears
+          EOF
+
+          cat > debian/control <<'EOF'
+          Source: mesa-panvk-kbase
+          Section: libs
+          Priority: optional
+          Maintainer: funnymdzz <funnymdzz@gmail.com>
+          Standards-Version: 4.7.0
+
+          Package: mesa-panvk-kbase
+          Architecture: arm64
+          Description: Mesa PanVK Vulkan ICD for proprietary Mali kbase CSF
+          EOF
+
+          SHLIB_DEPS="$(dpkg-shlibdeps -O \
+            -e"${LIBDIR}/libvulkan_panfrost_kbase.so" | \
+            sed -n 's/^shlibs:Depends=//p')"
+
+          cat > "${PACKAGE_ROOT}/DEBIAN/control" <<EOF
+          Package: ${PACKAGE_NAME}
+          Version: ${PACKAGE_VERSION}
+          Section: libs
+          Priority: optional
+          Architecture: arm64
+          Maintainer: funnymdzz <funnymdzz@gmail.com>
+          Depends: ${SHLIB_DEPS}, libvulkan1
+          Provides: vulkan-icd
+          Description: Mesa PanVK Vulkan ICD for proprietary Mali kbase CSF
+           Minimal release build for Mali-G610/G710 Android devices running
+           Debian-compatible Linux containers with X11 presentation.
+          EOF
+
+          dpkg-deb --root-owner-group --build "${PACKAGE_ROOT}" "${PACKAGE_FILE}"
+          dpkg-deb --info "${PACKAGE_FILE}"
+          dpkg-deb --contents "${PACKAGE_FILE}"
+
+          echo "PACKAGE_FILE=${PACKAGE_FILE}" >> "${GITHUB_ENV}"
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-panvk-kbase-release-arm64
+          path: ${{ env.PACKAGE_FILE }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/kbase-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${PACKAGE_FILE}" \
+              --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${PACKAGE_FILE}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --generate-notes \
+              --title "PanVK kbase ${GITHUB_REF_NAME}"
+          fi
