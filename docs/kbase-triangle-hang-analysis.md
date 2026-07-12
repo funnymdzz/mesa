@@ -14,6 +14,8 @@ Vulkan-only aarch64 build:
 - `vulkaninfo --summary`
 - `dEQP-VK.api.smoke.triangle` in five consecutive processes
 - all six `dEQP-VK.api.smoke.*` cases
+- XCB `vkcube` for 120 frames on Termux:X11
+- Xlib `vkcube` for 60 frames on Termux:X11
 
 ## Root cause
 
@@ -62,6 +64,19 @@ The current group-create ABI remains preferred so recoverable CS faults are
 delivered through kbase notifications, with the legacy ABI retained as a
 fallback.
 
+## X11 presentation
+
+kbase device fds are not DRM render nodes and cannot export GEM handles with
+`drmPrimeHandleToFD()`.  PanVK therefore selects Mesa WSI's CPU image path for
+kbase physical devices and disables DRM format modifiers.  Rendering still
+runs on the GPU; presentation copies through host-visible swapchain memory.
+DRM-backed PanVK devices retain the normal DMA-BUF/modifier path.
+
+Both XCB and Xlib presentation complete fixed-frame `vkcube` runs against
+Termux:X11.  Termux:X11 on the tested setup exposes only the filesystem Unix
+socket, so the chroot uses `DISPLAY=unix/:0` rather than `DISPLAY=:0`, which
+tries Android's unavailable abstract X11 socket first.
+
 ## Validation evidence
 
 On the Pixel 7, all three independent groups complete initialization through
@@ -71,15 +86,22 @@ API smoke group reports 6 passed, 0 failed, and 0 unsupported.  The previously
 failing
 `dEQP-VK.memory.pipeline_barrier.all_device.1048576_vertex_buffer_stride_2`
 case passes.  The compute basic group reports 74 passed and 6 unsupported,
-and the simple render-pass draw group reports 4 passed.
+and the simple render-pass draw group reports 4 passed.  The 1024-, 8192-,
+and 65536-element pipeline-barrier groups each report 26 passed, while the
+basic synchronization group reports 24 passed and 5 unsupported.
 
 ## Known limitation
 
 Each Vulkan queue consumes three CSG slots instead of one.  The tested G710
 reports eight slots, which is sufficient for this design.  Devices with fewer
 than three concurrently schedulable groups need additional validation,
-particularly around firmware time-slicing of cross-group GPU waits.  WSI and
-broad Vulkan conformance remain outside this milestone.
+particularly around firmware time-slicing of cross-group GPU waits.  Broad
+Vulkan conformance remains outside this milestone.
+
+The kbase X11 fallback cannot provide DMA-BUF direct scanout and incurs an
+extra CPU-visible presentation copy.  Native zero-copy presentation would
+require a kbase memory-export mechanism that is not available through the
+tested uAPI.
 
 The pathological
 `dEQP-VK.memory.pipeline_barrier.host_write_index_buffer.1048576` case can

@@ -45,17 +45,23 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
 {
    struct panvk_instance *instance =
       to_panvk_instance(physical_device->vk.instance);
+   const bool uses_kbase = physical_device->kbase_node_path[0] != '\0';
    VkResult result;
 
    result = wsi_device_init(&physical_device->wsi_device,
                             panvk_physical_device_to_handle(physical_device),
                             panvk_wsi_proc_addr, &instance->vk.alloc, -1,
                             &instance->dri_options,
-                            &(struct wsi_device_options){.sw_device = false});
+                            &(struct wsi_device_options){
+                               .sw_device = uses_kbase,
+                            });
    if (result != VK_SUCCESS)
       return result;
 
-   physical_device->wsi_device.supports_modifiers = true;
+   /* kbase is not a DRM fd and cannot export GEM handles through
+    * drmPrimeHandleToFD().  Use WSI's CPU image path for presentation while
+    * the GPU still renders the swapchain image. */
+   physical_device->wsi_device.supports_modifiers = !uses_kbase;
    physical_device->wsi_device.can_present_on_device =
       panvk_can_present_on_device;
 
