@@ -44,6 +44,7 @@ jobs:
             dpkg-dev \
             flex \
             gh \
+            git \
             glslang-tools \
             libclang-cpp-dev \
             libclang-dev \
