@@ -44,7 +44,6 @@ jobs:
             dpkg-dev \
             flex \
             gh \
-            git \
             glslang-tools \
             libclang-cpp-dev \
             libclang-dev \
@@ -129,7 +128,7 @@ jobs:
 
           MESA_VERSION="$(tr -d '[:space:]' < VERSION)"
           MESA_VERSION="${MESA_VERSION/-devel/~devel}"
-          PACKAGE_VERSION="${MESA_VERSION}+git$(git rev-parse --short=12 HEAD)-1"
+          PACKAGE_VERSION="${MESA_VERSION}+git${GITHUB_SHA:0:12}-1"
           PACKAGE_ROOT="${GITHUB_WORKSPACE}/package-root"
           PACKAGE_FILE="${PACKAGE_NAME}_${PACKAGE_VERSION}_arm64.deb"
           LIBDIR="${PACKAGE_ROOT}/usr/${MULTIARCH_LIBDIR}"
