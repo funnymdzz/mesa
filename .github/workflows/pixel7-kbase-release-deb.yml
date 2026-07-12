@@ -52,6 +52,7 @@ jobs:
             libexpat1-dev \
             libx11-dev \
             libx11-xcb-dev \
+            libxrandr-dev \
             libxcb-dri3-dev \
             libxcb-present-dev \
             libxcb-randr0-dev \
