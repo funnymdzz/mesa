@@ -3409,7 +3409,7 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
       cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
       PANVK_KBASE_PROGRESS_VT_AFTER_VT_END);
    panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, true,
-                          MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
+                          cmdbuf->sync_scope, add_val, sync_addr,
                           cs_defer_indirect());
    panvk_per_arch(kbase_mark_progress)(
       cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
@@ -3432,7 +3432,7 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
          cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
          PANVK_KBASE_PROGRESS_VT_AFTER_VT_END);
       panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, true,
-                             MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
+                             cmdbuf->sync_scope, add_val, sync_addr,
                              cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
       panvk_per_arch(kbase_mark_progress)(
          cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
@@ -3830,7 +3830,7 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
 #endif
 
       if (free_render_descs) {
-         cs_sync32_add(b, true, MALI_CS_SYNC_SCOPE_CSG, release_sz,
+         cs_sync32_add(b, true, cmdbuf->sync_scope, release_sz,
                        ringbuf_sync_addr, async);
       }
 
@@ -3871,13 +3871,13 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
                                            struct panvk_cs_occlusion_query, node) {
             cs_load64_to(b, oq_syncobj, oq_chain,
                          offsetof(struct panvk_cs_occlusion_query, syncobj));
-            cs_sync32_set(b, true, MALI_CS_SYNC_SCOPE_CSG, add_val_lo, oq_syncobj,
+            cs_sync32_set(b, true, cmdbuf->sync_scope, add_val_lo, oq_syncobj,
                           cs_defer(SB_MASK(DEFERRED_FLUSH), SB_ID(DEFERRED_SYNC)));
          }
       }
 
       panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_FRAGMENT, true,
-                             MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr, async);
+                             cmdbuf->sync_scope, add_val, sync_addr, async);
    }
 
    panvk_per_arch(kbase_mark_progress)(

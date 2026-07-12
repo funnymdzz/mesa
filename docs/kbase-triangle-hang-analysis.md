@@ -46,11 +46,17 @@ subqueue.  Each group contains one queue, bound to CSI0:
 - compute: one CSG, CSI0, `COMPUTE` resources
 
 The subqueues retain their existing shared GPU sync objects, so PanVK's
-cross-subqueue dependencies continue to work across the three groups.  All
-groups are published before ordinary submission waits begin, allowing the
-firmware to run dependent graphics work concurrently.  Initialization is
-validated strictly and sequentially; ring drain is no longer accepted as a
-substitute for a completion write.
+cross-subqueue dependencies continue to work across the three groups.  kbase
+requires those shared sync objects to be allocated with `BASE_MEM_CSF_EVENT`,
+and signals visible to another group must use system scope rather than CSG
+scope.  All groups are published before ordinary submission waits begin,
+allowing the firmware to run dependent graphics work concurrently.
+Initialization is validated strictly and sequentially; ring drain is no
+longer accepted as a substitute for a completion write.
+
+The kbase tiler heap allows 200 two-MiB chunks.  This matches the Valhall
+G610/G710 kbase reference implementation and avoids the tiler-iterator stall
+seen with Panthor's smaller 64-chunk default on large geometry workloads.
 
 The current group-create ABI remains preferred so recoverable CS faults are
 delivered through kbase notifications, with the legacy ABI retained as a
@@ -61,7 +67,11 @@ fallback.
 On the Pixel 7, all three independent groups complete initialization through
 CSI0.  A triangle submission then completes all three job-3 wrappers with
 stream progress `0xff0`; dEQP reports `Pass (Rendering succeeded)`.  The full
-API smoke group reports 6 passed, 0 failed, and 0 unsupported.
+API smoke group reports 6 passed, 0 failed, and 0 unsupported.  The previously
+failing
+`dEQP-VK.memory.pipeline_barrier.all_device.1048576_vertex_buffer_stride_2`
+case passes.  The compute basic group reports 74 passed and 6 unsupported,
+and the simple render-pass draw group reports 4 passed.
 
 ## Known limitation
 
@@ -70,3 +80,11 @@ reports eight slots, which is sufficient for this design.  Devices with fewer
 than three concurrently schedulable groups need additional validation,
 particularly around firmware time-slicing of cross-group GPU waits.  WSI and
 broad Vulkan conformance remain outside this milestone.
+
+The pathological
+`dEQP-VK.memory.pipeline_barrier.host_write_index_buffer.1048576` case can
+consume substantially more than the safe 200-chunk tiler limit.  A 4096-chunk
+experimental limit allowed that case to pass in isolation, but a longer run
+grew `deqp-vk` to about 5.2 GiB RSS and triggered Android's global OOM killer,
+also terminating SSH sessions and temporarily freezing the UI.  The 200-chunk
+limit is therefore deliberate; raising it is not a safe compatibility fix.

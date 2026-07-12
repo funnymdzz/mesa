@@ -501,6 +501,7 @@ struct panvk_cond_render_state {
 struct panvk_cmd_buffer {
    struct vk_command_buffer vk;
    VkCommandBufferUsageFlags flags;
+   enum mali_cs_sync_scope sync_scope;
    struct panvk_pool cs_pool;
    struct panvk_pool desc_pool;
    struct panvk_pool tls_pool;

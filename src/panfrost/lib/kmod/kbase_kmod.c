@@ -331,7 +331,8 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
                                 PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
                                 PAN_KMOD_BO_FLAG_NO_MMAP |
                                 PAN_KMOD_BO_FLAG_WB_MMAP |
-                                PAN_KMOD_BO_FLAG_GPU_UNCACHED;
+                                PAN_KMOD_BO_FLAG_GPU_UNCACHED |
+                                PAN_KMOD_BO_FLAG_CSF_EVENT;
 }
 
 /* -------------------------------------------------------------------------
@@ -1109,6 +1110,11 @@ to_kbase_mem_flags(uint32_t kmod_flags)
 
    if (kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT)
       flags |= BASE_MEM_GROW_ON_GPF;
+
+   if (kmod_flags & PAN_KMOD_BO_FLAG_CSF_EVENT) {
+      flags |= BASE_MEM_CSF_EVENT;
+      flags &= ~BASE_MEM_COHERENT_LOCAL;
+   }
 
    return flags;
 }

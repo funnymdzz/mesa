@@ -124,6 +124,9 @@ enum pan_kmod_bo_flags {
     * the KMD to force non-coherent mappings on IO coherent setup.
     */
    PAN_KMOD_BO_FLAG_IO_COHERENT = BITFIELD_BIT(7),
+
+   /* kbase CSF event memory monitored for cross-CSG synchronization. */
+   PAN_KMOD_BO_FLAG_CSF_EVENT = BITFIELD_BIT(8),
 };
 
 /* Allowed group priority flags. */

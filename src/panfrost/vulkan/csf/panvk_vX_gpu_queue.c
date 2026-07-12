@@ -12,6 +12,7 @@
 #include "panvk_cmd_buffer.h"
 #include "panvk_device_memory.h"
 #include "panvk_macros.h"
+#include "panvk_priv_bo.h"
 #include "panvk_queue.h"
 #include "panvk_utrace.h"
 
@@ -1614,7 +1615,25 @@ init_queue(struct panvk_gpu_queue *queue)
       .alignment = 64,
    };
 
-   queue->syncobjs = panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev)) {
+      struct panvk_priv_bo *sync_bo;
+      result = panvk_priv_bo_create(dev, alloc_info.size,
+                                    PAN_KMOD_BO_FLAG_CSF_EVENT,
+                                    VK_SYSTEM_ALLOCATION_SCOPE_DEVICE,
+                                    &sync_bo);
+      if (result != VK_SUCCESS)
+         return result;
+
+      queue->syncobjs = (struct panvk_priv_mem){
+         .bo = (uintptr_t)sync_bo,
+         .offset = 0,
+      };
+   } else
+#endif
+   {
+      queue->syncobjs = panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+   }
    if (!panvk_priv_mem_check_alloc(queue->syncobjs))
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to allocate subqueue sync objects");
@@ -1776,10 +1795,15 @@ init_tiler(struct panvk_gpu_queue *queue)
       /* KBASE_IOCTL_CS_TILER_HEAP_INIT.group_id selects a physical memory
        * group.  Keep it on the default group, matching panfork. */
       const uint32_t tiler_heap_mem_group = 0;
+      /* Match the Valhall G610/G710 kbase reference.  The panthor-derived
+       * limit of 64 can strand large geometry workloads on the tiler iterator;
+       * larger multi-GiB limits can trigger Android's global OOM killer. */
+      const uint32_t tiler_heap_max_chunks =
+         MAX2(phys_dev->csf.tiler.max_chunks, 200);
 
       if (kbase_kmod_csf_tiler_heap_create(
              dev->kmod.dev, tiler_heap->chunk_size,
-             phys_dev->csf.tiler.initial_chunks, phys_dev->csf.tiler.max_chunks,
+             phys_dev->csf.tiler.initial_chunks, tiler_heap_max_chunks,
              65535, tiler_heap_mem_group, &heap_ctx_va, &first_chunk_va)) {
          result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                                "Failed to create a tiler heap context");
@@ -1795,7 +1819,7 @@ init_tiler(struct panvk_gpu_queue *queue)
                 ", chunk size %u, initial %u, max %u, target %u, mem group %u",
                 heap_ctx_va, first_chunk_va, tiler_heap->chunk_size,
                 phys_dev->csf.tiler.initial_chunks,
-                phys_dev->csf.tiler.max_chunks, 65535,
+                tiler_heap_max_chunks, 65535,
                 tiler_heap_mem_group);
    } else
 #endif

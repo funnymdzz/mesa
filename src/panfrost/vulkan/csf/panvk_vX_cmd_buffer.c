@@ -244,7 +244,7 @@ finish_queries(struct panvk_cmd_buffer *cmdbuf)
                    offsetof(struct panvk_cs_timestamp_query, avail));
 
       cs_move32_to(b, signal_val, 1);
-      cs_sync32_set(b, true, MALI_CS_SYNC_SCOPE_CSG, signal_val, syncobj,
+      cs_sync32_set(b, true, cmdbuf->sync_scope, signal_val, syncobj,
                     cs_defer(SB_IMM_MASK, SB_ID(DEFERRED_SYNC)));
    }
 
@@ -695,7 +695,7 @@ panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
                       offsetof(struct panvk_cs_subqueue_context, syncobjs));
          cs_add64(b, sync_addr, sync_addr, sizeof(struct panvk_cs_sync64) * i);
          cs_move64_to(b, add_val, 1);
-         panvk_instr_sync64_add(cmdbuf, i, true, MALI_CS_SYNC_SCOPE_CSG,
+         panvk_instr_sync64_add(cmdbuf, i, true, cmdbuf->sync_scope,
                                 add_val, sync_addr, cs_now());
          ++cs_state->relative_sync_point;
       }
@@ -915,6 +915,14 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
       vk_free(&device->vk.alloc, cmdbuf);
       return result;
    }
+
+   cmdbuf->sync_scope = MALI_CS_SYNC_SCOPE_CSG;
+#ifdef HAVE_PAN_KMOD_KBASE
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(device->vk.physical);
+   if (phys_dev->kbase_node_path[0])
+      cmdbuf->sync_scope = MALI_CS_SYNC_SCOPE_SYSTEM;
+#endif
 
    list_inithead(&cmdbuf->push_sets);
    cmdbuf->vk.dynamic_graphics_state.vi = &cmdbuf->state.gfx.dynamic.vi;
