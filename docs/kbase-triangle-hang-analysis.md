@@ -16,6 +16,7 @@ Vulkan-only aarch64 build:
 - all six `dEQP-VK.api.smoke.*` cases
 - XCB `vkcube` for 120 frames on Termux:X11
 - Xlib `vkcube` for 60 frames on Termux:X11
+- the complete 13-case `vkmark -s 256x256` run (score 344)
 
 ## Root cause
 
@@ -53,12 +54,18 @@ requires those shared sync objects to be allocated with `BASE_MEM_CSF_EVENT`,
 and signals visible to another group must use system scope rather than CSG
 scope.  All groups are published before ordinary submission waits begin,
 allowing the firmware to run dependent graphics work concurrently.
-Initialization is validated strictly and sequentially; ring drain is no
-longer accepted as a substitute for a completion write.
+Initialization publishes all three groups before validating their completion;
+ring drain is no longer accepted as a substitute for a completion write.
 
 The kbase tiler heap allows 200 two-MiB chunks.  This matches the Valhall
 G610/G710 kbase reference implementation and avoids the tiler-iterator stall
-seen with Panthor's smaller 64-chunk default on large geometry workloads.
+seen with Panthor's smaller 64-chunk default on large geometry workloads.  The
+proprietary kernel accounts a render pass inside one CSG, so VT allocations
+from one compatibility CSG are not released by fragment completion in another
+CSG.  Since the kbase submit path waits for all three groups on the CPU, it can
+safely renew the heap every 32 graphics submissions.  Each graphics wrapper
+reissues `HEAP_SET` before its command-stream `CALL`, allowing it to pick up the
+new heap context while the Mesa heap descriptor remains at a stable address.
 
 The current group-create ABI remains preferred so recoverable CS faults are
 delivered through kbase notifications, with the legacy ABI retained as a
@@ -89,6 +96,11 @@ case passes.  The compute basic group reports 74 passed and 6 unsupported,
 and the simple render-pass draw group reports 4 passed.  The 1024-, 8192-,
 and 65536-element pipeline-barrier groups each report 26 passed, while the
 basic synchronization group reports 24 passed and 5 unsupported.
+
+Before periodic heap renewal, `vkmark` grew the heap monotonically to all 200
+chunks and then lost the device.  With renewal enabled, its vertex, texture,
+shading, effect2d, desktop, cube, and clear cases all complete on Termux:X11;
+the full run reports a score of 344 and exits successfully.
 
 ## Known limitation
 

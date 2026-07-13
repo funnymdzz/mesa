@@ -70,6 +70,7 @@
 #define KBASE_SEQNO_MARK_POST_CALL 0x200000000000ull
 #define KBASE_SEQNO_MARK_POST_WAIT 0x300000000000ull
 #define KBASE_CACHELINE_SIZE 64
+#define KBASE_TILER_HEAP_RENEW_INTERVAL 32
 
 static bool
 gpu_queue_uses_kbase(const struct panvk_device *dev)
@@ -485,6 +486,15 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    };
    uint64_t seqno_addr = kbase_subqueue_seqno_dev_addr(queue, subqueue);
    uint64_t target_seqno = subq->kbase.emitted_jobs + 1;
+
+   /* The heap context can be renewed between synchronous submissions to
+    * release chunks that proprietary kbase accounts per CSG.  Refresh the
+    * firmware heap state at every graphics CALL so it observes the current
+    * context address. */
+   if (subqueue != PANVK_SUBQUEUE_COMPUTE) {
+      cs_move64_to(&b, addr64, queue->tiler_heap.context.dev_addr);
+      cs_heap_set(&b, addr64);
+   }
 
    /* Diagnostic breadcrumbs in the seqno cell. If completion times out, these
     * tell us whether the ring entry started, whether the called stream
@@ -1133,6 +1143,7 @@ static VkResult
 kbase_submit_init_subqueues(struct panvk_gpu_queue *queue)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   uint32_t touched = 0;
 
    for (uint32_t subqueue = 0; subqueue < PANVK_SUBQUEUE_COUNT; subqueue++) {
       struct panvk_subqueue *subq = &queue->subqueues[subqueue];
@@ -1149,12 +1160,15 @@ kbase_submit_init_subqueues(struct panvk_gpu_queue *queue)
                              "Failed to initialize subqueue");
 
       subq->kbase.init_pending = 0;
+      touched |= BITFIELD_BIT(subqueue);
+   }
 
-      /* Start and validate each independent CSG before moving to the next
-       * subqueue.  A drained ring is not sufficient proof that its CS ran. */
-      kbase_subqueue_publish(queue, subqueue);
-      res = kbase_subqueue_wait_idle(queue, subqueue,
-                                     BITFIELD_BIT(subqueue), false);
+   u_foreach_bit(i, touched)
+      kbase_subqueue_publish(queue, i);
+
+   u_foreach_bit(i, touched) {
+      VkResult res =
+         kbase_subqueue_wait_idle(queue, i, touched, false);
       if (res != VK_SUCCESS)
          return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
                              "Failed to initialize subqueue");
@@ -1900,6 +1914,44 @@ cleanup_tiler(struct panvk_gpu_queue *queue)
    panvk_pool_free_mem(&tiler_heap->oom_fbd);
 }
 
+#ifdef HAVE_PAN_KMOD_KBASE
+static VkResult
+kbase_renew_tiler_heap(struct panvk_gpu_queue *queue)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+   struct panvk_tiler_heap *tiler_heap = &queue->tiler_heap;
+   const uint32_t max_chunks = MAX2(phys_dev->csf.tiler.max_chunks, 200);
+   uint64_t new_ctx, first_chunk;
+
+   if (kbase_kmod_csf_tiler_heap_create(
+          dev->kmod.dev, tiler_heap->chunk_size,
+          phys_dev->csf.tiler.initial_chunks, max_chunks, 65535, 0,
+          &new_ctx, &first_chunk)) {
+      return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "Failed to renew the kbase tiler heap");
+   }
+
+   uint64_t old_ctx = tiler_heap->context.dev_addr;
+   tiler_heap->context.dev_addr = new_ctx;
+
+   panvk_priv_mem_write_desc(tiler_heap->desc, 0, TILER_HEAP, cfg) {
+      cfg.size = tiler_heap->chunk_size;
+      cfg.base = first_chunk;
+      cfg.bottom = cfg.base + 64;
+      cfg.top = cfg.base + cfg.size;
+   }
+   kbase_clean_priv_mem(tiler_heap->desc, 0, pan_size(TILER_HEAP));
+
+   kbase_kmod_csf_tiler_heap_destroy(dev->kmod.dev, old_ctx);
+   mesa_logd("kbase: renewed tiler heap 0x%" PRIx64 " -> 0x%" PRIx64
+             ", first chunk 0x%" PRIx64,
+             old_ctx, new_ctx, first_chunk);
+   return VK_SUCCESS;
+}
+#endif
+
 struct panvk_queue_submit {
    const struct panvk_physical_device *phys_dev;
    struct panvk_device *dev;
@@ -2364,6 +2416,20 @@ panvk_queue_submit_ioctl_kbase(struct panvk_queue_submit *submit,
       result = kbase_subqueue_wait_idle(queue, i, touched, false);
       if (result != VK_SUCCESS)
          return result;
+   }
+
+   const uint32_t graphics_mask =
+      BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER) |
+      BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT);
+   if ((touched & graphics_mask) &&
+       ++queue->kbase_tiler_submit_count >=
+          KBASE_TILER_HEAP_RENEW_INTERVAL) {
+      result = kbase_renew_tiler_heap(queue);
+      if (result != VK_SUCCESS)
+         return vk_queue_set_lost(&queue->vk,
+                                  "kbase: tiler heap renewal failed");
+
+      queue->kbase_tiler_submit_count = 0;
    }
 
    return VK_SUCCESS;

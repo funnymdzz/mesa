@@ -135,6 +135,7 @@ struct panvk_gpu_queue {
       void *cpu;
       uint64_t dev;
    } kbase_seqnos;
+   uint32_t kbase_tiler_submit_count;
 #endif
 
    struct {
