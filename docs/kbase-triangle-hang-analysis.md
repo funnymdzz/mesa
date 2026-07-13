@@ -57,15 +57,23 @@ allowing the firmware to run dependent graphics work concurrently.
 Initialization publishes all three groups before validating their completion;
 ring drain is no longer accepted as a substitute for a completion write.
 
+Ordinary kbase submissions are asynchronous.  Each bottom-level Vulkan sync
+stores a snapshot of the three GPU completion seqnos; fence, semaphore and
+queue-idle CPU waits resolve that snapshot on demand.  The userspace ring only
+waits when it is about to overwrite unconsumed entries.  Active queues are
+notified through their USER_IO doorbell, with the queue-kick ioctl retained
+for inactive or concurrently suspended groups.
+
 The kbase tiler heap allows 200 two-MiB chunks.  This matches the Valhall
 G610/G710 kbase reference implementation and avoids the tiler-iterator stall
 seen with Panthor's smaller 64-chunk default on large geometry workloads.  The
 proprietary kernel accounts a render pass inside one CSG, so VT allocations
 from one compatibility CSG are not released by fragment completion in another
-CSG.  Since the kbase submit path waits for all three groups on the CPU, it can
-safely renew the heap every 32 graphics submissions.  Each graphics wrapper
-reissues `HEAP_SET` before its command-stream `CALL`, allowing it to pick up the
-new heap context while the Mesa heap descriptor remains at a stable address.
+CSG.  The submit path therefore drains its current completion snapshot before
+renewing the heap every 32 graphics submissions.  Each graphics wrapper
+reissues `HEAP_SET` before its command-stream `CALL`, allowing it to pick up
+the new heap context while the Mesa heap descriptor remains at a stable
+address.
 
 The current group-create ABI remains preferred so recoverable CS faults are
 delivered through kbase notifications, with the legacy ABI retained as a
@@ -101,6 +109,13 @@ Before periodic heap renewal, `vkmark` grew the heap monotonically to all 200
 chunks and then lost the device.  With renewal enabled, its vertex, texture,
 shading, effect2d, desktop, cube, and clear cases all complete on Termux:X11;
 the full run reports a score of 344 and exits successfully.
+
+The asynchronous release build completes 1000 immediate-mode XCB `vkcube`
+frames and a full 800x600 `vkmark` run without a device loss.  A 100-frame
+ioctl trace contains only the three initial queue-kick ioctls; subsequent
+submissions use the active-queue doorbells.  At 256x256 the effect2d blur case
+improves from 369 to 408 FPS.  At 800x600 the CPU-image X11 path remains the
+dominant cost, so the full score changes only from 162 to 168.
 
 ## Known limitation
 

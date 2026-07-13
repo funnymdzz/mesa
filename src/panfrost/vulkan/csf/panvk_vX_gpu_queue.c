@@ -47,11 +47,9 @@
  * equivalent sequence ourselves, publish the new insert offset through
  * the USER_IO input page and kick the scheduler.
  *
- * Synchronization is currently fully synchronous: every submission is
- * CPU-waited on a per-subqueue completion cell written after all scoreboard
- * slots have retired, and semaphore waits/signals are resolved on the CPU.
- * Asynchronous submission needs a real kbase fence/event integration and is
- * left for later.
+ * Completion is tracked with per-subqueue GPU seqnos.  Vulkan sync objects
+ * retain a snapshot of those seqnos and only wait when the application asks
+ * for completion; ordinary queue submission remains asynchronous.
  */
 
 #define KBASE_RINGBUF_SIZE     (64 * 1024)
@@ -71,6 +69,11 @@
 #define KBASE_SEQNO_MARK_POST_WAIT 0x300000000000ull
 #define KBASE_CACHELINE_SIZE 64
 #define KBASE_TILER_HEAP_RENEW_INTERVAL 32
+
+static VkResult
+kbase_subqueue_wait_seqno(struct panvk_gpu_queue *queue, uint32_t subqueue,
+                          uint64_t target_seqno, uint32_t rekick_mask,
+                          bool allow_ring_drain, uint64_t abs_timeout_ns);
 
 static bool
 gpu_queue_uses_kbase(const struct panvk_device *dev)
@@ -352,12 +355,14 @@ kbase_init_seqnos(struct panvk_gpu_queue *queue)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
 
-   /* Keep the seqno/diagnostic cells on the same normal kbase memory path as
-    * CS rings and private pools.  Some Android kbase stacks expose
-    * GPU-uncached BOs differently enough that CS LS/SYNC writes don't become
-    * observable from userspace. */
+   /* Completion uses SYNC_ADD64, so request CSF event notifications for this
+    * BO.  This wakes ppoll() as soon as a pending fence target retires instead
+    * of making a waiter sleep until its periodic timeout.  Keep the normal
+    * cached memory path: GPU-uncached BOs are not CPU-observable on all
+    * Android kbase stacks. */
    queue->kbase_seqnos.bo =
-      pan_kmod_bo_alloc(dev->kmod.dev, dev->kmod.vm, 4096, 0);
+      pan_kmod_bo_alloc(dev->kmod.dev, dev->kmod.vm, 4096,
+                       PAN_KMOD_BO_FLAG_CSF_EVENT);
    if (!queue->kbase_seqnos.bo)
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to allocate kbase seqno cells");
@@ -398,6 +403,39 @@ kbase_init_seqnos(struct panvk_gpu_queue *queue)
  * 4 of the register file) are clobbered, which the rest of the driver
  * stays away from. */
 static VkResult
+kbase_subqueue_reserve_ring(struct panvk_gpu_queue *queue,
+                            uint32_t subqueue)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   struct panvk_subqueue *subq = &queue->subqueues[subqueue];
+   const uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
+   uint64_t extract = *(volatile uint64_t *)(output_page +
+                                             CS_USER_IO_OUTPUT_CS_EXTRACT);
+   uint32_t offset = subq->kbase.insert % KBASE_RINGBUF_SIZE;
+   uint64_t required = KBASE_RING_JOB_MAX_SIZE;
+
+   if (offset + KBASE_RING_JOB_MAX_SIZE > KBASE_RINGBUF_SIZE)
+      required += KBASE_RINGBUF_SIZE - offset;
+
+   if (subq->kbase.insert - extract + required <= KBASE_RINGBUF_SIZE)
+      return VK_SUCCESS;
+
+   VkResult result = kbase_subqueue_wait_seqno(
+      queue, subqueue, subq->kbase.emitted_jobs, BITFIELD_BIT(subqueue),
+      false, UINT64_MAX);
+   if (result != VK_SUCCESS)
+      return result;
+
+   extract = *(volatile uint64_t *)(output_page +
+                                    CS_USER_IO_OUTPUT_CS_EXTRACT);
+   if (subq->kbase.insert - extract + required > KBASE_RINGBUF_SIZE)
+      return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "kbase: CS ring did not reclaim consumed space");
+
+   return VK_SUCCESS;
+}
+
+static VkResult
 kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
                         uint64_t stream_addr, uint32_t stream_size,
                         uint32_t flush_id)
@@ -405,6 +443,10 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    const struct drm_panthor_csif_info *csif_info = panvk_get_csif_props(dev);
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
+
+   VkResult result = kbase_subqueue_reserve_ring(queue, subqueue);
+   if (result != VK_SUCCESS)
+      return result;
 
    uint32_t offset = subq->kbase.insert % KBASE_RINGBUF_SIZE;
 
@@ -615,18 +657,28 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
    *(volatile uint64_t *)(input_page + CS_USER_IO_INPUT_CS_INSERT) =
       subq->kbase.insert;
 
-   /* Make the new insert offset visible before asking kbase to schedule or
-    * resume the queue.  Do not ring the userspace doorbell here: unlike the
-    * ioctl, it is only safe for an already-active CSI and can race a group
-    * suspend. */
+   /* Active queues can consume a userspace doorbell without an ioctl.  Check
+    * CS_ACTIVE again after ringing it; if a suspend raced the write, the
+    * scheduler kick below safely resumes the group. */
    kbase_gpu_wmb();
+   uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
+   volatile uint32_t *active =
+      (volatile uint32_t *)(output_page + CS_USER_IO_OUTPUT_CS_ACTIVE);
+
+   if (*active) {
+      *(volatile uint32_t *)subq->kbase.user_io = 1;
+      kbase_gpu_wmb();
+      if (*active)
+         return;
+   }
 
    kbase_kmod_csf_queue_kick(dev->kmod.dev, subq->kbase.ringbuf_dev);
 }
 
 static VkResult
-kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
-                         uint32_t rekick_mask, bool allow_ring_drain)
+kbase_subqueue_wait_seqno(struct panvk_gpu_queue *queue, uint32_t subqueue,
+                          uint64_t target_seqno, uint32_t rekick_mask,
+                          bool allow_ring_drain, uint64_t abs_timeout_ns)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
@@ -648,10 +700,11 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
       (volatile uint32_t *)((volatile uint8_t *)cell +
                             KBASE_SEQNO_STREAM_PROGRESS_OFFSET);
    const uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
-   uint64_t target_seqno = subq->kbase.emitted_jobs;
    uint64_t target_insert = subq->kbase.insert;
    int64_t start = os_time_get_nano();
    int64_t last_kick = start;
+   uint64_t watchdog = (uint64_t)start + KBASE_WAIT_TIMEOUT_NS;
+   uint64_t deadline = MIN2(abs_timeout_ns, watchdog);
 
    /* CS_EXTRACT only reports how far firmware has fetched the command stream;
     * asynchronous GPU jobs issued by those commands may still be running.
@@ -688,7 +741,10 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
          last_kick = now;
       }
 
-      if (now - start > KBASE_WAIT_TIMEOUT_NS) {
+      if ((uint64_t)now >= deadline) {
+         if (deadline < watchdog)
+            return VK_TIMEOUT;
+
          const volatile uint64_t *ring = subq->kbase.ringbuf_cpu;
          uint64_t extract_line = extract & ~(uint64_t)63;
          uint64_t last_off = subq->kbase.last_job_offset;
@@ -763,7 +819,11 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
        * group scheduling — while we wait.  A pure spin starves that path.
        * Cap the blocking wait so the re-kick timer and overall timeout
        * still fire. */
-      kbase_kmod_csf_wait_event(dev->kmod.dev, 20ll * 1000000ll);
+      int64_t remaining = deadline > (uint64_t)now
+                             ? MIN2(deadline - (uint64_t)now,
+                                    20ull * 1000000ull)
+                             : 0;
+      kbase_kmod_csf_wait_event(dev->kmod.dev, remaining);
    }
 
    mesa_logd("kbase: completed subqueue %u job %" PRIu64
@@ -774,6 +834,28 @@ kbase_subqueue_wait_idle(struct panvk_gpu_queue *queue, uint32_t subqueue,
              cell->seqno >= target_seqno || *ls_copy >= target_seqno
                 ? ""
                 : " (ring-drain init fallback)");
+
+   return VK_SUCCESS;
+}
+
+static VkResult
+kbase_queue_wait_current(struct panvk_gpu_queue *queue,
+                         uint64_t abs_timeout_ns)
+{
+   uint32_t target_mask = 0;
+
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      if (queue->subqueues[i].kbase.emitted_jobs)
+         target_mask |= BITFIELD_BIT(i);
+   }
+
+   u_foreach_bit(i, target_mask) {
+      VkResult result = kbase_subqueue_wait_seqno(
+         queue, i, queue->subqueues[i].kbase.emitted_jobs, target_mask, false,
+         abs_timeout_ns);
+      if (result != VK_SUCCESS)
+         return result;
+   }
 
    return VK_SUCCESS;
 }
@@ -1167,8 +1249,9 @@ kbase_submit_init_subqueues(struct panvk_gpu_queue *queue)
       kbase_subqueue_publish(queue, i);
 
    u_foreach_bit(i, touched) {
-      VkResult res =
-         kbase_subqueue_wait_idle(queue, i, touched, false);
+      VkResult res = kbase_subqueue_wait_seqno(
+         queue, i, queue->subqueues[i].kbase.emitted_jobs, touched, false,
+         UINT64_MAX);
       if (res != VK_SUCCESS)
          return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
                              "Failed to initialize subqueue");
@@ -1969,6 +2052,10 @@ struct panvk_queue_submit {
    struct drm_panthor_sync_op *wait_ops;
    struct drm_panthor_sync_op *signal_ops;
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   uint64_t kbase_target_seqnos[PANVK_SUBQUEUE_COUNT];
+#endif
+
    struct {
       uint32_t queue_mask;
       enum panvk_subqueue_id first_subqueue;
@@ -2366,12 +2453,35 @@ panvk_queue_submit_init_signals(struct panvk_queue_submit *submit,
 }
 
 #ifdef HAVE_PAN_KMOD_KBASE
-/* Synchronous kbase submission: resolve semaphore waits on the CPU, write
- * the ring entries, kick every touched subqueue, then wait for all of them
- * to drain before signaling the semaphores on the CPU.  All subqueues must
- * be kicked before waiting on any of them: their streams synchronize with
- * each other through the syncobjs table, so running them serially would
- * deadlock. */
+static VkResult
+kbase_wait_sync_targets(
+   void *data, const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT],
+   uint64_t abs_timeout_ns)
+{
+   struct panvk_gpu_queue *queue = data;
+   uint32_t target_mask = 0;
+
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      if (targets[i])
+         target_mask |= BITFIELD_BIT(i);
+   }
+
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      if (!targets[i])
+         continue;
+
+      VkResult result = kbase_subqueue_wait_seqno(
+         queue, i, targets[i], target_mask, false, abs_timeout_ns);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   return VK_SUCCESS;
+}
+
+/* Incoming CPU syncs are resolved before emission.  The new work itself is
+ * only published here; completion is represented by the seqno snapshot and
+ * consumed later by fence/semaphore waits. */
 static VkResult
 panvk_queue_submit_ioctl_kbase(struct panvk_queue_submit *submit,
                                const struct vk_queue_submit *vk_submit)
@@ -2412,8 +2522,12 @@ panvk_queue_submit_ioctl_kbase(struct panvk_queue_submit *submit,
    u_foreach_bit(i, touched)
       kbase_subqueue_publish(queue, i);
 
-   u_foreach_bit(i, touched) {
-      result = kbase_subqueue_wait_idle(queue, i, touched, false);
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+      submit->kbase_target_seqnos[i] = queue->subqueues[i].kbase.emitted_jobs;
+
+   if (submit->force_sync) {
+      result = kbase_wait_sync_targets(queue, submit->kbase_target_seqnos,
+                                       UINT64_MAX);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -2424,6 +2538,11 @@ panvk_queue_submit_ioctl_kbase(struct panvk_queue_submit *submit,
    if ((touched & graphics_mask) &&
        ++queue->kbase_tiler_submit_count >=
           KBASE_TILER_HEAP_RENEW_INTERVAL) {
+      result = kbase_wait_sync_targets(queue, submit->kbase_target_seqnos,
+                                       UINT64_MAX);
+      if (result != VK_SUCCESS)
+         return result;
+
       result = kbase_renew_tiler_heap(queue);
       if (result != VK_SUCCESS)
          return vk_queue_set_lost(&queue->vk,
@@ -2439,16 +2558,12 @@ static void
 panvk_queue_submit_process_signals_kbase(struct panvk_queue_submit *submit,
                                          const struct vk_queue_submit *vk_submit)
 {
-   struct panvk_device *dev = submit->dev;
-
-   /* The GPU work already completed (synchronous model), so semaphore
-    * signals happen right away on the CPU. */
    for (uint32_t i = 0; i < vk_submit->signal_count; i++) {
       const struct vk_sync_signal *signal = &vk_submit->signals[i];
-
-      ASSERTED VkResult result =
-         vk_sync_signal(&dev->vk, signal->sync, signal->signal_value);
-      assert(result == VK_SUCCESS);
+      assert(signal->signal_value == 0);
+      panvk_kbase_sync_set_pending(signal->sync, submit->queue,
+                                   kbase_wait_sync_targets,
+                                   submit->kbase_target_seqnos);
    }
 }
 #endif /* HAVE_PAN_KMOD_KBASE */
@@ -2784,6 +2899,11 @@ panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
 {
    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (gpu_queue_uses_kbase(dev))
+      kbase_queue_wait_current(queue, UINT64_MAX);
+#endif
 
    cleanup_queue(queue);
 #ifdef HAVE_PAN_KMOD_KBASE

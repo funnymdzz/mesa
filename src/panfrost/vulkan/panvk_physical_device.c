@@ -15,8 +15,10 @@
 #include <fcntl.h>
 
 #include "util/disk_cache.h"
+#include "util/cnd_monotonic.h"
 #include "util/os_misc.h"
 #include "util/os_time.h"
+#include "util/timespec.h"
 #include "util/u_atomic.h"
 #include "git_sha1.h"
 
@@ -405,18 +407,23 @@ get_device_sync_types(struct panvk_physical_device *device,
 
 #if defined(HAVE_PAN_KMOD_KBASE)
 
-/* -------------------------------------------------------------------------
- * CPU-based binary sync type for kbase
- *
- * kbase does not expose DRM syncobj, so a host-side spin-wait binary sync is
- * used as a placeholder.  It provides all features required by
- * vk_sync_timeline_get_type() and by the panvk physical-device init path.
- * Actual GPU synchronisation for kbase will be wired up separately.
- * ---------------------------------------------------------------------- */
+enum kbase_cpu_sync_state {
+   KBASE_CPU_SYNC_RESET,
+   KBASE_CPU_SYNC_PENDING,
+   KBASE_CPU_SYNC_WAITING,
+   KBASE_CPU_SYNC_SIGNALED,
+   KBASE_CPU_SYNC_FAILED,
+};
 
 struct kbase_cpu_sync {
    struct vk_sync sync;
-   uint32_t signaled; /* accessed via p_atomic_* */
+   mtx_t mutex;
+   struct u_cnd_monotonic cond;
+   enum kbase_cpu_sync_state state;
+   VkResult result;
+   void *pending_data;
+   panvk_kbase_sync_wait_func pending_wait;
+   uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT];
 };
 
 static VkResult
@@ -424,14 +431,30 @@ kbase_cpu_sync_init(struct vk_device *device, struct vk_sync *sync,
                     uint64_t initial_value)
 {
    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
-   p_atomic_set(&ks->signaled, initial_value != 0 ? 1 : 0);
+   int ret = mtx_init(&ks->mutex, mtx_plain);
+   if (ret != thrd_success)
+      return vk_errorf(device, VK_ERROR_UNKNOWN, "mtx_init failed");
+
+   ret = u_cnd_monotonic_init(&ks->cond);
+   if (ret != thrd_success) {
+      mtx_destroy(&ks->mutex);
+      return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_init failed");
+   }
+
+   ks->state = initial_value ? KBASE_CPU_SYNC_SIGNALED : KBASE_CPU_SYNC_RESET;
+   ks->result = VK_SUCCESS;
+   ks->pending_data = NULL;
+   ks->pending_wait = NULL;
+   memset(ks->targets, 0, sizeof(ks->targets));
    return VK_SUCCESS;
 }
 
 static void
-kbase_cpu_sync_finish(UNUSED struct vk_device *device,
-                      UNUSED struct vk_sync *sync)
+kbase_cpu_sync_finish(UNUSED struct vk_device *device, struct vk_sync *sync)
 {
+   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
+   u_cnd_monotonic_destroy(&ks->cond);
+   mtx_destroy(&ks->mutex);
 }
 
 static VkResult
@@ -439,7 +462,13 @@ kbase_cpu_sync_signal(UNUSED struct vk_device *device, struct vk_sync *sync,
                       UNUSED uint64_t value)
 {
    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
-   p_atomic_set(&ks->signaled, 1);
+   mtx_lock(&ks->mutex);
+   ks->state = KBASE_CPU_SYNC_SIGNALED;
+   ks->result = VK_SUCCESS;
+   ks->pending_data = NULL;
+   ks->pending_wait = NULL;
+   u_cnd_monotonic_broadcast(&ks->cond);
+   mtx_unlock(&ks->mutex);
    return VK_SUCCESS;
 }
 
@@ -447,42 +476,147 @@ static VkResult
 kbase_cpu_sync_reset(UNUSED struct vk_device *device, struct vk_sync *sync)
 {
    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
-   p_atomic_set(&ks->signaled, 0);
+   mtx_lock(&ks->mutex);
+   assert(ks->state != KBASE_CPU_SYNC_WAITING);
+   ks->state = KBASE_CPU_SYNC_RESET;
+   ks->result = VK_SUCCESS;
+   ks->pending_data = NULL;
+   ks->pending_wait = NULL;
+   memset(ks->targets, 0, sizeof(ks->targets));
+   mtx_unlock(&ks->mutex);
    return VK_SUCCESS;
 }
 
 static VkResult
-kbase_cpu_sync_wait_many(UNUSED struct vk_device *device,
+kbase_cpu_sync_wait_many(struct vk_device *device, uint32_t wait_count,
+                         const struct vk_sync_wait *waits,
+                         enum vk_sync_wait_flags wait_flags,
+                         uint64_t abs_timeout_ns);
+
+void
+panvk_kbase_sync_set_pending(
+   struct vk_sync *sync, void *data, panvk_kbase_sync_wait_func wait,
+   const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT])
+{
+   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
+
+   assert(sync->type->wait_many == kbase_cpu_sync_wait_many);
+   mtx_lock(&ks->mutex);
+   assert(ks->state == KBASE_CPU_SYNC_RESET);
+   ks->pending_data = data;
+   ks->pending_wait = wait;
+   memcpy(ks->targets, targets, sizeof(ks->targets));
+   ks->result = VK_SUCCESS;
+   ks->state = KBASE_CPU_SYNC_PENDING;
+   u_cnd_monotonic_broadcast(&ks->cond);
+   mtx_unlock(&ks->mutex);
+}
+
+static VkResult
+kbase_cpu_sync_wait_one(struct vk_device *device, struct kbase_cpu_sync *ks,
+                        enum vk_sync_wait_flags wait_flags,
+                        uint64_t abs_timeout_ns)
+{
+   struct timespec abs_timeout_ts;
+   timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
+
+   mtx_lock(&ks->mutex);
+   while (true) {
+      switch (ks->state) {
+      case KBASE_CPU_SYNC_SIGNALED:
+         mtx_unlock(&ks->mutex);
+         return VK_SUCCESS;
+      case KBASE_CPU_SYNC_FAILED: {
+         VkResult result = ks->result;
+         mtx_unlock(&ks->mutex);
+         return result;
+      }
+      case KBASE_CPU_SYNC_PENDING: {
+         if (wait_flags & VK_SYNC_WAIT_PENDING) {
+            mtx_unlock(&ks->mutex);
+            return VK_SUCCESS;
+         }
+
+         panvk_kbase_sync_wait_func wait = ks->pending_wait;
+         void *data = ks->pending_data;
+         uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT];
+         memcpy(targets, ks->targets, sizeof(targets));
+         ks->state = KBASE_CPU_SYNC_WAITING;
+         mtx_unlock(&ks->mutex);
+
+         VkResult result = wait(data, targets, abs_timeout_ns);
+
+         mtx_lock(&ks->mutex);
+         if (result == VK_SUCCESS) {
+            ks->state = KBASE_CPU_SYNC_SIGNALED;
+            ks->pending_data = NULL;
+            ks->pending_wait = NULL;
+         } else if (result == VK_TIMEOUT) {
+            ks->state = KBASE_CPU_SYNC_PENDING;
+         } else {
+            ks->state = KBASE_CPU_SYNC_FAILED;
+            ks->result = result;
+         }
+         u_cnd_monotonic_broadcast(&ks->cond);
+         mtx_unlock(&ks->mutex);
+         return result;
+      }
+      case KBASE_CPU_SYNC_RESET:
+      case KBASE_CPU_SYNC_WAITING: {
+         if (abs_timeout_ns == 0) {
+            mtx_unlock(&ks->mutex);
+            return VK_TIMEOUT;
+         }
+
+         int ret = u_cnd_monotonic_timedwait(&ks->cond, &ks->mutex,
+                                              &abs_timeout_ts);
+         if (ret == thrd_timedout) {
+            mtx_unlock(&ks->mutex);
+            return VK_TIMEOUT;
+         }
+         if (ret != thrd_success) {
+            mtx_unlock(&ks->mutex);
+            return vk_errorf(device, VK_ERROR_UNKNOWN,
+                             "kbase sync condition wait failed");
+         }
+         break;
+      }
+      }
+   }
+}
+
+static VkResult
+kbase_cpu_sync_wait_many(struct vk_device *device,
                          uint32_t wait_count, const struct vk_sync_wait *waits,
                          enum vk_sync_wait_flags wait_flags,
                          uint64_t abs_timeout_ns)
 {
    bool wait_any = !!(wait_flags & VK_SYNC_WAIT_ANY);
 
-   while (true) {
-      bool have_unsignaled = false;
-
+   if (!wait_any) {
       for (uint32_t i = 0; i < wait_count; i++) {
          struct kbase_cpu_sync *ks =
             container_of(waits[i].sync, struct kbase_cpu_sync, sync);
-
-         if (p_atomic_read(&ks->signaled)) {
-            if (wait_any)
-               return VK_SUCCESS;
-         } else {
-            have_unsignaled = true;
-         }
+         VkResult result = kbase_cpu_sync_wait_one(
+            device, ks, wait_flags, abs_timeout_ns);
+         if (result != VK_SUCCESS)
+            return result;
       }
+      return VK_SUCCESS;
+   }
 
-      if (!have_unsignaled)
-         return VK_SUCCESS;
-
-      if (abs_timeout_ns == 0)
+   while (true) {
+      for (uint32_t i = 0; i < wait_count; i++) {
+         struct kbase_cpu_sync *ks =
+            container_of(waits[i].sync, struct kbase_cpu_sync, sync);
+         VkResult result = kbase_cpu_sync_wait_one(device, ks, wait_flags, 0);
+         if (result == VK_SUCCESS)
+            return VK_SUCCESS;
+         if (result != VK_TIMEOUT)
+            return result;
+      }
+      if (abs_timeout_ns == 0 || os_time_get_nano() >= abs_timeout_ns)
          return VK_TIMEOUT;
-
-      if (os_time_get_nano() >= abs_timeout_ns)
-         return VK_TIMEOUT;
-
       sched_yield();
    }
 }
@@ -491,14 +625,37 @@ static VkResult
 kbase_cpu_sync_move(UNUSED struct vk_device *device, struct vk_sync *dst,
                     struct vk_sync *src)
 {
+   if (dst == src)
+      return VK_SUCCESS;
+
    struct kbase_cpu_sync *ks_dst =
       container_of(dst, struct kbase_cpu_sync, sync);
    struct kbase_cpu_sync *ks_src =
       container_of(src, struct kbase_cpu_sync, sync);
 
-   uint32_t val = p_atomic_read(&ks_src->signaled);
-   p_atomic_set(&ks_src->signaled, 0);
-   p_atomic_set(&ks_dst->signaled, val);
+   struct kbase_cpu_sync *first =
+      (uintptr_t)ks_dst < (uintptr_t)ks_src ? ks_dst : ks_src;
+   struct kbase_cpu_sync *second = first == ks_dst ? ks_src : ks_dst;
+   mtx_lock(&first->mutex);
+   mtx_lock(&second->mutex);
+   assert(ks_src->state != KBASE_CPU_SYNC_WAITING);
+   assert(ks_dst->state != KBASE_CPU_SYNC_WAITING);
+
+   ks_dst->state = ks_src->state;
+   ks_dst->result = ks_src->result;
+   ks_dst->pending_data = ks_src->pending_data;
+   ks_dst->pending_wait = ks_src->pending_wait;
+   memcpy(ks_dst->targets, ks_src->targets, sizeof(ks_dst->targets));
+
+   ks_src->state = KBASE_CPU_SYNC_RESET;
+   ks_src->result = VK_SUCCESS;
+   ks_src->pending_data = NULL;
+   ks_src->pending_wait = NULL;
+   memset(ks_src->targets, 0, sizeof(ks_src->targets));
+   u_cnd_monotonic_broadcast(&ks_dst->cond);
+   u_cnd_monotonic_broadcast(&ks_src->cond);
+   mtx_unlock(&second->mutex);
+   mtx_unlock(&first->mutex);
    return VK_SUCCESS;
 }
 
@@ -534,8 +691,8 @@ get_device_sync_types_kbase(struct panvk_physical_device *device,
    device->drm_syncobj_type = kbase_cpu_sync_type;
 
    /* Binary CPU sync first (fences need a binary type with CPU_RESET),
-    * software timeline emulation second (timeline semaphores).  The
-    * kbase submission model resolves all of these on the CPU. */
+    * software timeline emulation second (timeline semaphores).  Submitted
+    * syncs carry kbase GPU seqno targets and resolve them on CPU wait. */
    device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
 
    device->sync_timeline_type =
