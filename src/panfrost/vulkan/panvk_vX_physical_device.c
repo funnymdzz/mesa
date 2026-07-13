@@ -208,6 +208,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_texel_buffer_alignment = true,
+      .EXT_transform_feedback = PAN_ARCH >= 10,
       .EXT_astc_decode_mode = PAN_ARCH >= 9,
       .EXT_texture_compression_astc_hdr = true,
       .EXT_tooling_info = true,
@@ -551,6 +552,10 @@ panvk_per_arch(get_physical_device_features)(
       /* VK_EXT_conditional_rendering */
       .conditionalRendering = PAN_ARCH >= 10,
       .inheritedConditionalRendering = PAN_ARCH >= 10,
+
+      /* VK_EXT_transform_feedback */
+      .transformFeedback = PAN_ARCH >= 10,
+      .geometryStreams = false,
 
       /* VK_EXT_custom_border_color */
       .customBorderColors = true,
@@ -1220,6 +1225,18 @@ panvk_per_arch(get_physical_device_properties)(
       /* VK_EXT_provoking_vertex */
       .provokingVertexModePerPipeline = false,
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+
+      /* VK_EXT_transform_feedback */
+      .maxTransformFeedbackStreams = 1,
+      .maxTransformFeedbackBuffers = PANVK_MAX_XFB_BUFFERS,
+      .maxTransformFeedbackBufferSize = UINT32_MAX,
+      .maxTransformFeedbackStreamDataSize = 2048,
+      .maxTransformFeedbackBufferDataSize = 512,
+      .maxTransformFeedbackBufferDataStride = 2048,
+      .transformFeedbackQueries = false,
+      .transformFeedbackStreamsLinesTriangles = false,
+      .transformFeedbackRasterizationStreamSelect = false,
+      .transformFeedbackDraw = false,
 
       /* VK_ANDROID_native_buffer */
       .sharedImage = vk_android_get_front_buffer_usage() != 0,

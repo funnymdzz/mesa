@@ -19,6 +19,10 @@ struct panvk_push_constant_state {
    uint64_t data[MAX_PUSH_CONSTANTS_SIZE / sizeof(uint64_t)];
 };
 
+VkResult panvk_per_arch(cmd_alloc_push_uniforms)(
+   struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,
+   uint32_t repeat_count, uint64_t *push_ptr);
+
 VkResult panvk_per_arch(cmd_prepare_push_uniforms)(
    struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,
    uint32_t repeat_count);

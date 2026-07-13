@@ -28,6 +28,7 @@
 
 #define MAX_VBS 16
 #define MAX_FRAMEBUFFER_LAYERS 256
+#define PANVK_MAX_XFB_BUFFERS 4
 
 struct panvk_cmd_buffer;
 
@@ -149,6 +150,17 @@ struct panvk_cmd_graphics_state {
    struct panvk_prims_generated_query_state prims_generated_query;
 #endif
    struct panvk_graphics_sysvals sysvals;
+
+   struct {
+      struct {
+         uint64_t address;
+         uint64_t size;
+      } buffers[PANVK_MAX_XFB_BUFFERS];
+      struct pan_ptr offsets;
+      struct panvk_shader_desc_state desc;
+      uint64_t push_uniforms;
+      bool enabled;
+   } xfb;
 
 #if PAN_ARCH < 9
    struct panvk_shader_link link;

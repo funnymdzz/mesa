@@ -157,6 +157,13 @@ struct panvk_graphics_sysvals {
    } vs;
 
    struct {
+      aligned_u64 base[MAX_XFB_BUFFERS];
+      aligned_u64 offset_ptr[MAX_XFB_BUFFERS];
+      uint32_t num_vertices;
+      uint32_t _pad;
+   } xfb;
+
+   struct {
       aligned_u64 blend_descs[MAX_RTS];
    } fs;
 
@@ -383,6 +390,7 @@ struct panvk_shader_desc_info {
 
 struct panvk_shader_variant {
    struct pan_shader_info info;
+   uint16_t xfb_stride[MAX_XFB_BUFFERS];
 
    union {
       struct {
@@ -431,6 +439,9 @@ enum panvk_vs_variant {
    /* Hardware vertex shader, when next stage is fragment */
    PANVK_VS_VARIANT_HW,
 
+   /* Vertex shader dispatched as compute for transform feedback. */
+   PANVK_VS_VARIANT_XFB,
+
    PANVK_VS_VARIANTS,
 };
 
@@ -451,6 +462,7 @@ panvk_shader_num_variants(mesa_shader_stage stage)
 
 static const char *panvk_vs_shader_variant_name[] = {
    [PANVK_VS_VARIANT_HW] = NULL,
+   [PANVK_VS_VARIANT_XFB] = "xfb",
 };
 
 static const char *
@@ -487,6 +499,15 @@ panvk_shader_hw_variant(const struct panvk_shader *shader)
       return NULL;
 
    return &shader->variants[0];
+}
+
+static const struct panvk_shader_variant *
+panvk_shader_xfb_variant(const struct panvk_shader *shader)
+{
+   if (!shader)
+      return NULL;
+
+   return &shader->variants[PANVK_VS_VARIANT_XFB];
 }
 
 static inline uint64_t

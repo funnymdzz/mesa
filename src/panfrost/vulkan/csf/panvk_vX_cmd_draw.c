@@ -598,6 +598,8 @@ update_tls(struct panvk_cmd_buffer *cmdbuf)
    struct panvk_tls_state *state = &cmdbuf->state.tls;
    const struct panvk_shader_variant *vs =
       panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_variant *xfb =
+      panvk_shader_xfb_variant(cmdbuf->state.gfx.vs.shader);
    const struct panvk_shader_variant *fs =
       panvk_shader_only_variant(cmdbuf->state.gfx.fs.shader);
    struct cs_builder *b =
@@ -624,8 +626,9 @@ update_tls(struct panvk_cmd_buffer *cmdbuf)
       }
    }
 
-   state->info.tls.size =
-      MAX3(vs->info.tls_size, fs ? fs->info.tls_size : 0, state->info.tls.size);
+   state->info.tls.size = MAX3(
+      MAX2(vs->info.tls_size, xfb->info.tls_size),
+      fs ? fs->info.tls_size : 0, state->info.tls.size);
    return VK_SUCCESS;
 }
 
@@ -2586,6 +2589,110 @@ update_prims_generated_query(struct panvk_cmd_buffer *cmdbuf,
    }
 }
 
+static VkResult
+launch_xfb(struct panvk_cmd_buffer *cmdbuf,
+           const struct panvk_draw_info *draw)
+{
+   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
+   const struct panvk_shader_variant *xfb =
+      panvk_shader_xfb_variant(gfx->vs.shader);
+
+   if (!gfx->xfb.enabled)
+      return VK_SUCCESS;
+
+   if (!panvk_priv_mem_check_alloc(xfb->code_mem))
+      return VK_SUCCESS;
+
+   /* The software XFB lowering currently launches one invocation per input
+    * vertex. This matches the existing Panfrost CSF path. Indexed draws will
+    * need a separate index-fetch lowering for strict Vulkan conformance. */
+   if (draw->indirect.buffer_dev_addr)
+      return VK_SUCCESS;
+
+   for (uint32_t i = 0; i < PANVK_MAX_XFB_BUFFERS; i++) {
+      gfx->sysvals.xfb.base[i] = gfx->xfb.buffers[i].address;
+      gfx->sysvals.xfb.offset_ptr[i] =
+         gfx->xfb.offsets.gpu + i * sizeof(uint32_t);
+   }
+   gfx->sysvals.xfb.num_vertices = draw->vertex.count;
+
+   VkResult result = panvk_per_arch(cmd_alloc_push_uniforms)(
+      cmdbuf, xfb, 1, &gfx->xfb.push_uniforms);
+   if (result != VK_SUCCESS)
+      return result;
+
+   gfx->xfb.desc.driver_set = gfx->vs.desc.driver_set;
+   result = panvk_per_arch(cmd_prepare_shader_res_table)(
+      cmdbuf, &gfx->desc_state, xfb, &gfx->xfb.desc, 1);
+   if (result != VK_SUCCESS)
+      return result;
+
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct cs_builder *b =
+      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+
+   cs_update_compute_ctx(b) {
+      cs_move64_to(b, cs_reg64(b, PANVK_COMPUTE_SRT),
+                   gfx->xfb.desc.res_table);
+      cs_move64_to(b, cs_reg64(b, PANVK_COMPUTE_FAU),
+                   gfx->xfb.push_uniforms |
+                      ((uint64_t)xfb->fau.total_count << 56));
+#if PAN_ARCH >= 12
+      cs_move64_to(b, cs_reg64(b, PANVK_COMPUTE_SPD),
+                   panvk_priv_mem_dev_addr(xfb->spds.all_triangles));
+#else
+      cs_move64_to(b, cs_reg64(b, PANVK_COMPUTE_SPD),
+                   panvk_priv_mem_dev_addr(xfb->spds.pos_triangles));
+#endif
+      cs_move64_to(b, cs_reg64(b, PANVK_COMPUTE_TSD),
+                   cmdbuf->state.tls.desc.gpu);
+
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
+                   draw->vertex.base);
+
+      struct mali_compute_size_workgroup_packed wg_size;
+      pan_pack(&wg_size, COMPUTE_SIZE_WORKGROUP, cfg) {
+         cfg.workgroup_size_x = 1;
+         cfg.workgroup_size_y = 1;
+         cfg.workgroup_size_z = 1;
+         cfg.allow_merging_workgroups = true;
+      }
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, WG_SIZE), wg_size.opaque[0]);
+
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_X), 0);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Y), 0);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Z), 0);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X),
+                   draw->vertex.count);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y),
+                   draw->instance.count);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), 1);
+   }
+
+   cs_run_compute(b, 1, MALI_TASK_AXIS_Z, PANVK_COMPUTE_RES_SEL);
+   cs_wait_slots(b, dev->csf.sb.all_iters_mask);
+
+   struct cs_index offsets_addr = cs_scratch_reg64(b, 0);
+   struct cs_index offset = cs_scratch_reg32(b, 2);
+   cs_move64_to(b, offsets_addr, gfx->xfb.offsets.gpu);
+
+   for (uint32_t i = 0; i < PANVK_MAX_XFB_BUFFERS; i++) {
+      if (!xfb->xfb_stride[i])
+         continue;
+
+      const uint32_t bytes_written =
+         draw->vertex.count * draw->instance.count *
+         xfb->xfb_stride[i];
+      cs_load32_to(b, offset, offsets_addr, i * sizeof(uint32_t));
+      cs_flush_loads(b);
+      cs_add32(b, offset, offset, bytes_written);
+      cs_store32(b, offset, offsets_addr, i * sizeof(uint32_t));
+   }
+   cs_flush_stores(b);
+
+   return VK_SUCCESS;
+}
+
 static void
 panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
 {
@@ -2607,6 +2714,10 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
       fs_required(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state);
 
    result = prepare_draw(cmdbuf, draw);
+   if (result != VK_SUCCESS)
+      return;
+
+   result = launch_xfb(cmdbuf, draw);
    if (result != VK_SUCCESS)
       return;
 

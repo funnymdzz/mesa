@@ -30,6 +30,7 @@
 #include "nir_builder.h"
 #include "nir_conversion_builder.h"
 #include "nir_deref.h"
+#include "nir_xfb_info.h"
 
 #include "shader_enums.h"
 #include "vk_graphics_state.h"
@@ -90,6 +91,19 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_load_base_instance:
       val = load_sysval(b, graphics, bit_size, vs.base_instance);
       break;
+   case nir_intrinsic_load_num_vertices:
+      val = load_sysval(b, graphics, bit_size, xfb.num_vertices);
+      break;
+   case nir_intrinsic_load_xfb_address: {
+      const unsigned idx = nir_intrinsic_base(intr);
+      nir_def *base = load_sysval_entry(
+         b, graphics, 64, xfb.base, nir_imm_int(b, idx));
+      nir_def *offset_ptr = load_sysval_entry(
+         b, graphics, 64, xfb.offset_ptr, nir_imm_int(b, idx));
+      nir_def *offset = nir_load_global(b, 1, 32, offset_ptr, 4, 0);
+      val = nir_iadd(b, base, nir_u2u64(b, offset));
+      break;
+   }
    case nir_intrinsic_load_noperspective_varyings_pan:
       /* TODO: use a VS epilog specialized on constant noperspective_varyings
        * with VK_EXT_graphics_pipeline_libraries and VK_EXT_shader_object */
@@ -199,15 +213,16 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
 
 static bool
 panvk_lower_load_vs_input(nir_builder *b, nir_intrinsic_instr *intrin,
-                           UNUSED void *data)
+                           void *data)
 {
    if (intrin->intrinsic != nir_intrinsic_load_input)
       return false;
 
+   const bool no_idvs = *(const bool *)data;
    b->cursor = nir_before_instr(&intrin->instr);
    nir_def *ld_attr = nir_load_attribute_pan(
       b, intrin->def.num_components, intrin->def.bit_size,
-      PAN_ARCH < 9 ?
+      PAN_ARCH < 9 || no_idvs ?
          nir_load_raw_vertex_id_pan(b) :
          nir_load_vertex_id(b),
       nir_load_instance_id(b),
@@ -964,7 +979,7 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
 
    if (nir->info.stage == MESA_SHADER_VERTEX)
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, panvk_lower_load_vs_input,
-               nir_metadata_control_flow, NULL);
+               nir_metadata_control_flow, &input.no_idvs);
 
    pan_postprocess_nir(nir, &input, &shader->info);
 
@@ -1357,14 +1372,21 @@ panvk_compile_shader(struct panvk_device *dev,
 
    switch (info->stage) {
    case MESA_SHADER_VERTEX: {
-      const enum panvk_vs_variant last_variant = PANVK_VS_VARIANT_HW;
-      for (enum panvk_vs_variant v = 0; v <= last_variant; v++) {
+      const enum panvk_vs_variant compile_order[] = {
+         PANVK_VS_VARIANT_XFB,
+         PANVK_VS_VARIANT_HW,
+      };
+
+      for (unsigned pass = 0; pass < ARRAY_SIZE(compile_order); pass++) {
+         const enum panvk_vs_variant v = compile_order[pass];
          struct panvk_shader_variant *variant = &shader->variants[v];
 
-         /* Each variant gets its own NIR. To save an extra clone, we use the
-          * original NIR for the last stage.
-          */
-         const bool clone_nir = (v != last_variant);
+         if (v == PANVK_VS_VARIANT_XFB &&
+             (PAN_ARCH < 10 || info->nir->xfb_info == NULL))
+            continue;
+
+         /* The hardware variant consumes the original NIR. */
+         const bool clone_nir = v != PANVK_VS_VARIANT_HW;
          nir_shader *nir =
             clone_nir ? nir_shader_clone(NULL, info->nir) : info->nir;
 
@@ -1389,6 +1411,14 @@ panvk_compile_shader(struct panvk_device *dev,
          }
 #endif
 
+         if (v == PANVK_VS_VARIANT_XFB) {
+            for (uint32_t i = 0; i < MAX_XFB_BUFFERS; i++)
+               variant->xfb_stride[i] = nir->xfb_info->buffers[i].stride;
+            inputs.no_idvs = true;
+         } else {
+            inputs.no_idvs = false;
+         }
+
          panvk_lower_nir(dev, nir, info->set_layout_count,
                          info->set_layouts, info->robustness,
                          state, &variant->desc_info, false);
@@ -1406,19 +1436,31 @@ panvk_compile_shader(struct panvk_device *dev,
          }
          nir_assign_io_var_locations(nir, nir_var_shader_out);
          panvk_lower_nir_io(nir);
-         /* This somehow folds the location for multi-slot nir_load/nir_store */
-         NIR_PASS(_, nir, nir_opt_constant_folding);
+
+         if (v == PANVK_VS_VARIANT_XFB)
+            NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
 
          inputs.trust_varying_flat_highp_types = true;
          struct pan_varying_layout varying_layout;
-         if (v == PANVK_VS_VARIANT_HW) {
-            pan_varying_collect_formats(&varying_layout, nir, inputs.gpu_id,
-                                        inputs.trust_varying_flat_highp_types,
-                                        true);
-            pan_build_varying_layout_compact(&varying_layout, nir,
-                                             inputs.gpu_id);
-            inputs.varying_layout = &varying_layout;
+         pan_varying_collect_formats(&varying_layout, nir, inputs.gpu_id,
+                                     inputs.trust_varying_flat_highp_types,
+                                     true);
+         pan_build_varying_layout_compact(&varying_layout, nir,
+                                          inputs.gpu_id);
+         inputs.varying_layout = &varying_layout;
+
+         if (v == PANVK_VS_VARIANT_XFB) {
+            NIR_PASS(_, nir, pan_nir_lower_xfb);
+
+            /* pan_nir_lower_xfb() replaces varying stores with global memory
+             * writes.  Refresh shader info so the backend does not treat this
+             * no-IDVS variant as an empty vertex shader.
+             */
+            nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
          }
+
+         /* This somehow folds the location for multi-slot nir_load/nir_store */
+         NIR_PASS(_, nir, nir_opt_constant_folding);
 
          variant->own_bin = true;
 
