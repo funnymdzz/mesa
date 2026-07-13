@@ -10,6 +10,9 @@
  */
 
 #include <sched.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <fcntl.h>
@@ -121,6 +124,230 @@ create_kmod_dev(struct panvk_physical_device *device,
 }
 
 #if defined(HAVE_PAN_KMOD_KBASE)
+static bool
+kbase_sysfs_read(const char *dir, const char *name, char *value,
+                 size_t value_size)
+{
+   char path[192];
+   snprintf(path, sizeof(path), "%s/%s", dir, name);
+
+   int fd = open(path, O_RDONLY | O_CLOEXEC);
+   if (fd < 0)
+      return false;
+
+   ssize_t len = read(fd, value, value_size - 1);
+   int saved_errno = errno;
+   close(fd);
+   errno = saved_errno;
+   if (len <= 0)
+      return false;
+
+   while (len > 0 && (value[len - 1] == '\n' || value[len - 1] == ' '))
+      len--;
+   value[len] = '\0';
+   return true;
+}
+
+static bool
+kbase_sysfs_write(const char *dir, const char *name, const char *value)
+{
+   char path[192];
+   snprintf(path, sizeof(path), "%s/%s", dir, name);
+
+   int fd = open(path, O_WRONLY | O_CLOEXEC);
+   if (fd < 0)
+      return false;
+
+   size_t len = strlen(value);
+   ssize_t written = write(fd, value, len);
+   int saved_errno = errno;
+   close(fd);
+   errno = saved_errno;
+   return written == len;
+}
+
+static bool
+kbase_sysfs_has_value(const char *values, const char *wanted)
+{
+   const char *start = values;
+
+   while (*start) {
+      while (*start == ' ' || *start == '\n')
+         start++;
+
+      const char *end = start;
+      while (*end && *end != ' ' && *end != '\n')
+         end++;
+
+      if ((size_t)(end - start) == strlen(wanted) &&
+          !strncmp(start, wanted, end - start))
+         return true;
+
+      start = end;
+   }
+
+   return false;
+}
+
+static bool
+kbase_parse_frequencies(const char *values, uint32_t requested,
+                        uint32_t *min_freq, uint32_t *max_freq,
+                        bool *requested_available)
+{
+   char frequencies[512];
+   snprintf(frequencies, sizeof(frequencies), "%s", values);
+
+   *min_freq = UINT32_MAX;
+   *max_freq = 0;
+   *requested_available = false;
+
+   char *saveptr = NULL;
+   for (char *token = strtok_r(frequencies, " \n", &saveptr); token;
+        token = strtok_r(NULL, " \n", &saveptr)) {
+      char *end = NULL;
+      errno = 0;
+      unsigned long freq = strtoul(token, &end, 10);
+      if (errno || !end || *end || freq > UINT32_MAX)
+         return false;
+
+      *min_freq = MIN2(*min_freq, (uint32_t)freq);
+      *max_freq = MAX2(*max_freq, (uint32_t)freq);
+      *requested_available |= requested == freq;
+   }
+
+   return *max_freq != 0;
+}
+
+static bool
+kbase_set_frequency_range(const char *sysfs, uint32_t min_freq,
+                          uint32_t max_freq)
+{
+   char min_value[32], max_value[32];
+   snprintf(min_value, sizeof(min_value), "%u\n", min_freq);
+   snprintf(max_value, sizeof(max_value), "%u\n", max_freq);
+
+   /* Lower the minimum first when expanding/down-clocking a range.  Raise
+    * the maximum first when selecting a higher fixed frequency. */
+   char current_min_value[32];
+   uint32_t current_min = 0;
+   if (kbase_sysfs_read(sysfs, "scaling_min_freq", current_min_value,
+                        sizeof(current_min_value)))
+      current_min = strtoul(current_min_value, NULL, 10);
+
+   if (max_freq < current_min) {
+      return kbase_sysfs_write(sysfs, "scaling_min_freq", min_value) &&
+             kbase_sysfs_write(sysfs, "scaling_max_freq", max_value);
+   }
+
+   return kbase_sysfs_write(sysfs, "scaling_max_freq", max_value) &&
+          kbase_sysfs_write(sysfs, "scaling_min_freq", min_value);
+}
+
+static void
+configure_kbase_dvfs(const char *device_path)
+{
+   const char *option = os_get_option("PANVK_KBASE_DVFS");
+   if (!option || !option[0] || !strcmp(option, "none"))
+      return;
+
+   const char *device_name = strrchr(device_path, '/');
+   device_name = device_name ? device_name + 1 : device_path;
+
+   char sysfs[128];
+   snprintf(sysfs, sizeof(sysfs), "/sys/class/misc/%s/device", device_name);
+
+   char available_frequencies[512];
+   if (!kbase_sysfs_read(sysfs, "available_frequencies",
+                         available_frequencies,
+                         sizeof(available_frequencies))) {
+      mesa_logw("kbase: PANVK_KBASE_DVFS=%s ignored: cannot read %s", option,
+                sysfs);
+      return;
+   }
+
+   bool auto_mode = !strcmp(option, "auto");
+   bool default_mode = !strcmp(option, "default");
+   bool max_mode = !strcmp(option, "max");
+   uint32_t requested = 0;
+
+   if (!auto_mode && !default_mode && !max_mode) {
+      char *end = NULL;
+      errno = 0;
+      unsigned long parsed = strtoul(option, &end, 10);
+      if (errno || !end || *end || parsed > UINT32_MAX)
+         goto invalid_option;
+      requested = parsed;
+   }
+
+   uint32_t min_freq, max_freq;
+   bool requested_available;
+   if (!kbase_parse_frequencies(available_frequencies, requested, &min_freq,
+                                &max_freq, &requested_available)) {
+      mesa_logw("kbase: cannot parse available GPU frequencies from %s",
+                sysfs);
+      return;
+   }
+
+   if (max_mode) {
+      requested = max_freq;
+      requested_available = true;
+   }
+
+   if (auto_mode || default_mode) {
+      if (!kbase_set_frequency_range(sysfs, min_freq, max_freq))
+         goto write_failed;
+
+      const char *governor =
+         default_mode ? "quickstep" : "quickstep_use_mcu";
+      char available_governors[256];
+      if (!kbase_sysfs_read(sysfs, "available_governors",
+                            available_governors,
+                            sizeof(available_governors)))
+         goto write_failed;
+
+      if (auto_mode &&
+          !kbase_sysfs_has_value(available_governors, governor))
+         governor = "capacity_use_mcu";
+
+      if (!kbase_sysfs_has_value(available_governors, governor)) {
+         mesa_logw("kbase: requested DVFS governor is unavailable (%s)",
+                   available_governors);
+         return;
+      }
+
+      char governor_value[64];
+      snprintf(governor_value, sizeof(governor_value), "%s\n", governor);
+      if (!kbase_sysfs_write(sysfs, "governor", governor_value))
+         goto write_failed;
+
+      mesa_logi("kbase: GPU DVFS governor %s, range %u-%u kHz", governor,
+                min_freq, max_freq);
+      return;
+   }
+
+   if (!requested_available) {
+      mesa_logw("kbase: requested GPU frequency %u kHz is unavailable (%s)",
+                requested, available_frequencies);
+      return;
+   }
+
+   if (!kbase_set_frequency_range(sysfs, requested, requested))
+      goto write_failed;
+
+   mesa_logi("kbase: GPU frequency fixed at %u kHz", requested);
+   return;
+
+invalid_option:
+   mesa_logw("kbase: invalid PANVK_KBASE_DVFS value '%s' "
+             "(expected auto, default, max, none, or a frequency in kHz)",
+             option);
+   return;
+
+write_failed:
+   mesa_logw("kbase: PANVK_KBASE_DVFS=%s could not configure %s: %s", option,
+             sysfs, strerror(errno));
+}
+
 static VkResult
 create_kmod_dev_kbase(struct panvk_physical_device *device,
                       const struct panvk_instance *instance,
@@ -153,6 +380,7 @@ create_kmod_dev_kbase(struct panvk_physical_device *device,
 
    snprintf(device->kbase_node_path, sizeof(device->kbase_node_path), "%s",
             path);
+   configure_kbase_dvfs(path);
 
    return VK_SUCCESS;
 }
