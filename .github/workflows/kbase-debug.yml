@@ -1,5 +1,5 @@
 ---
-name: Pixel 7 kbase debug Mesa
+name: PanVK kbase debug Mesa
 
 'on':
   push:
@@ -10,13 +10,13 @@ permissions:
   contents: read
 
 jobs:
-  build-pixel7-kbase:
-    name: Build Pixel 7 debug Mesa
+  build-kbase-debug:
+    name: Build PanVK kbase debug Mesa
     runs-on: ubuntu-24.04-arm
     container:
       image: debian:13
     env:
-      ARTIFACT_NAME: mesa-pixel7-kbase-debug-aarch64
+      ARTIFACT_NAME: mesa-panvk-kbase-debug-aarch64
       BUILD_DIR: build
       INSTALL_PREFIX: /opt/mesa
     steps:
@@ -88,7 +88,7 @@ jobs:
             -Dzstd=disabled
 
       - name: Build
-        run: meson compile -C "${BUILD_DIR}"
+        run: meson compile -C "${BUILD_DIR}" -j "$(nproc)"
 
       - name: Install
         run: |
