@@ -139,7 +139,8 @@ jobs:
             spirv-llvm-translator \
             spirv-tools \
             vulkan-icd-loader \
-            zlib
+            zlib \
+            zstd
 
       - name: Configure minimal release build
         shell: bash
@@ -299,6 +300,7 @@ jobs:
 
           useradd --create-home builder
           chown -R builder:builder "${PACKAGE_DIR}"
+          sed -i "s/^PKGEXT=.*/PKGEXT='.pkg.tar.zst'/" /etc/makepkg.conf
           runuser -u builder -- bash -c \
             'cd "$1" && makepkg --noconfirm --force' _ "${PACKAGE_DIR}"
           BUILT_PACKAGE="$(runuser -u builder -- bash -c \
@@ -387,7 +389,8 @@ jobs:
         shell: bash
         run: |
           cd release-assets
-          sha256sum *.deb *.pkg.tar.zst *.tar.gz > SHA256SUMS
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | \
+            xargs -0 sha256sum > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create or update release
