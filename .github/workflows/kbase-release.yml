@@ -406,13 +406,14 @@ jobs:
           else
             RELEASE_TAG="${REQUESTED_TAG}"
           fi
+          RELEASE_VERSION="${RELEASE_TAG#kbase-}"
 
           mapfile -t ASSETS < <(find release-assets -maxdepth 1 -type f -print | sort)
           if gh release view "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release edit "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
-              --title "PanVK kbase ${RELEASE_TAG}" \
+              --title "PanVK kbase ${RELEASE_VERSION}" \
               --notes-file .github/panvk-kbase-release-notes.md
             gh release upload "${RELEASE_TAG}" "${ASSETS[@]}" \
               --repo "${GITHUB_REPOSITORY}" --clobber
@@ -420,6 +421,6 @@ jobs:
             gh release create "${RELEASE_TAG}" "${ASSETS[@]}" \
               --repo "${GITHUB_REPOSITORY}" \
               --target "${GITHUB_SHA}" \
-              --title "PanVK kbase ${RELEASE_TAG}" \
+              --title "PanVK kbase ${RELEASE_VERSION}" \
               --notes-file .github/panvk-kbase-release-notes.md
           fi
