@@ -102,6 +102,10 @@ jobs:
             --no-install-recommends \
             "libclc-${LLVM_MAJOR}-dev" \
             "libllvmspirvlib-${LLVM_MAJOR}-dev"
+          if [[ "${TARGET}" == ubuntu2604 ]]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              --no-install-recommends spirv-tools-dev
+          fi
           python3 -m pip install --break-system-packages \
             'meson>=1.4.0,<2'
 
