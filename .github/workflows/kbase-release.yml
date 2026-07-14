@@ -66,6 +66,7 @@ jobs:
             bison \
             build-essential \
             ca-certificates \
+            cmake \
             dpkg-dev \
             flex \
             glslang-tools \
@@ -108,10 +109,11 @@ jobs:
         if: matrix.family == 'arch'
         shell: bash
         run: |
-          pacman -Syu --noconfirm --needed \
+          pacman --disable-sandbox -Syu --noconfirm --needed \
             base-devel \
             bison \
             clang \
+            cmake \
             flex \
             glslang \
             libclc \
