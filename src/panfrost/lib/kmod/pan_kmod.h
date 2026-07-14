@@ -441,6 +441,19 @@ struct pan_kmod_ops {
    struct pan_kmod_bo *(*bo_import)(struct pan_kmod_dev *dev, uint32_t handle,
                                     uint64_t size);
 
+   /* Import a dma-buf directly, without converting it to a DRM GEM handle.
+    * Non-DRM backends such as kbase can implement this instead of bo_import.
+    * This method is optional.
+    */
+   struct pan_kmod_bo *(*bo_import_fd)(struct pan_kmod_dev *dev, int fd,
+                                      uint64_t size);
+
+   /* Export a dma-buf directly, without converting a DRM GEM handle.  Returns
+    * a new close-on-exec fd on success, -1 otherwise.  This method is
+    * optional.
+    */
+   int (*bo_export_fd)(struct pan_kmod_bo *bo);
+
    /* Post export operations.
     * Return 0 on success, -1 otherwise.
     * This method is optional.
@@ -671,10 +684,16 @@ pan_kmod_bo_export(struct pan_kmod_bo *bo)
 
    int fd;
 
-   if (drmPrimeHandleToFD(bo->dev->fd, bo->handle, DRM_CLOEXEC | DRM_RDWR,
-                          &fd)) {
-      mesa_loge("drmPrimeHandleToFD() failed (err=%d)", errno);
-      return -1;
+   if (bo->dev->ops->bo_export_fd) {
+      fd = bo->dev->ops->bo_export_fd(bo);
+      if (fd < 0)
+         return -1;
+   } else {
+      if (drmPrimeHandleToFD(bo->dev->fd, bo->handle,
+                             DRM_CLOEXEC | DRM_RDWR, &fd)) {
+         mesa_loge("drmPrimeHandleToFD() failed (err=%d)", errno);
+         return -1;
+      }
    }
 
    if (bo->dev->ops->bo_export && bo->dev->ops->bo_export(bo, fd)) {

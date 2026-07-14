@@ -198,6 +198,29 @@ pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
 
    simple_mtx_lock(&dev->handle_to_bo.lock);
 
+   if (dev->ops->bo_import_fd) {
+      size_t size = lseek(fd, 0, SEEK_END);
+      if (size == 0 || size == (size_t)-1) {
+         mesa_loge("invalid dmabuf size");
+         goto err_unlock;
+      }
+
+      bo = dev->ops->bo_import_fd(dev, fd, size);
+      if (!bo)
+         goto err_unlock;
+
+      slot = util_sparse_array_get(&dev->handle_to_bo.array, bo->handle);
+      if (!slot) {
+         bo->dev->ops->bo_free(bo);
+         bo = NULL;
+         goto err_unlock;
+      }
+
+      assert(*slot == NULL);
+      *slot = bo;
+      goto out_unlock;
+   }
+
    uint32_t handle;
    int ret = drmPrimeFDToHandle(dev->fd, fd, &handle);
    if (ret)
@@ -227,6 +250,7 @@ pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
 
    assert(p_atomic_read(&bo->refcnt) > 0);
 
+out_unlock:
    simple_mtx_unlock(&dev->handle_to_bo.lock);
 
    return bo;
